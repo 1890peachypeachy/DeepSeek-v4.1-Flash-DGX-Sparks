@@ -15,9 +15,9 @@ endpoint.
 
 | | |
 |---|---|
-| Decode, 1 request | ~82 ms per speculative step, 35-50 tok/s depending on accept length |
-| Decode, 4 requests | ~63 tok/s aggregate (80 tok/s at the best steps) |
-| Context | 256k limit configured (model max 1M); prompts up to 32k verified, the head runs out of memory above ~40k; KV pool 750k tokens |
+| Decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms (~82 ms per speculative step) |
+| Decode, prose, 2 / 3 / 4 streams | 58.9 / 71.2 / 78.6 tok/s aggregate (30.5 / 24.5 / 20.9 per stream), TTFT 424 / 311 / 383 ms |
+| Context | 200k-256k limit configured (model max 1M); verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts; KV pool 750k tokens |
 | Memory left on the head while serving | ~6 GB (was <1 GB) |
 | Greedy decoding | deterministic run to run |
 
