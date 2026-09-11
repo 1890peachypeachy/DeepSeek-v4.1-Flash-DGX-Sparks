@@ -14,7 +14,9 @@ ENV PYTHONPATH=/opt/dsv41/adapter \
     MODEL_PATH=/models/DeepSeek-V4.1-Flash \
     STATE_PATH=/state OFFLOAD_MODE=nvme DSV41_CACHE_GIB=16
 EXPOSE 8888
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30m --retries=3 \
-    CMD ["python3", "/opt/dsv41/boot.py", "health"]
+# -S: skip site (the adapter's sitecustomize imports the engine, which takes >10 s on a
+# busy head and marked the container unhealthy during long prefills); health needs stdlib only.
+HEALTHCHECK --interval=30s --timeout=30s --start-period=30m --retries=3 \
+    CMD ["python3", "-S", "/opt/dsv41/boot.py", "health"]
 ENTRYPOINT ["python3", "-u", "/opt/dsv41/boot.py"]
 CMD ["run"]
