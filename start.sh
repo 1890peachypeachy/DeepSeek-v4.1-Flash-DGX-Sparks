@@ -523,11 +523,13 @@ cmd_build() {
   for h in "${WORKER_HOSTS[@]}"; do
     info "rsync recipe → $h:$WORKER_DIR"
     remote_on "$h" "mkdir -p $(printf '%q' "$WORKER_DIR")"
+    # WORKER_HOSTS entries already carry user@host (our fleet has per-node
+    # usernames); do NOT prepend WORKER_USER again or we get user@user@host.
     rsync -aH --delete --exclude '.env' --exclude '.env.tp4' --exclude 'state' --exclude 'state-tp4' \
       --exclude 'logs' --exclude 'logs-tp4' --exclude 'models' \
       --exclude 'engram' \
       -e "$(ssh_rsync_e)" \
-      "$ROOT/" "${WORKER_USER}@${h}:${WORKER_DIR}/"
+      "$ROOT/" "${h}:${WORKER_DIR}/"
     info "docker build on $h ..."
     remote_on "$h" --timeout "${BUILD_TIMEOUT:-0}" \
       "docker image inspect $(printf '%q' "$BASE_IMAGE") >/dev/null || docker pull --platform linux/arm64 $(printf '%q' "$BASE_IMAGE")
