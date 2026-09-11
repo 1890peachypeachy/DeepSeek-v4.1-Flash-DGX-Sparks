@@ -22,6 +22,27 @@ def load_dotenv(path: str) -> None:
             os.environ.setdefault(k.strip(), v)
 
 
+def resolve_user_host(host: str, user: str) -> tuple[str, str]:
+    """Resolve the ssh user for a target host.
+
+    Upstream assumes ONE uniform WORKER_USER on every rank. Our fleet has
+    per-node usernames (spark / spark2 / spark3), so allow either an explicit
+    'user@host' target or a WORKER_USER_MAP env of the form
+    "10.73.0.1=spark,10.73.0.2=spark2" (host or user@host on the left).
+    """
+    if "@" in host:
+        u, _, h = host.partition("@")
+        return u, h
+    for pair in os.environ.get("WORKER_USER_MAP", "").split(","):
+        if "=" not in pair:
+            continue
+        h, u = pair.split("=", 1)
+        h, u = h.strip(), u.strip()
+        if h == host or h.partition("@")[2] == host:
+            return u, host
+    return user, host
+
+
 def ssh_cmd(
     host: str,
     user: str,
@@ -30,6 +51,7 @@ def ssh_cmd(
     identity: str | None,
     timeout: int,
 ) -> int:
+    user, host = resolve_user_host(host, user)
     dest = f"{user}@{host}"
     base = [
         "ssh",
