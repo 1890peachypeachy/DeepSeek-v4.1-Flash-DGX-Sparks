@@ -13,13 +13,6 @@ ConnectX-7 RoCE triangle: **native MXFP4 experts, FP8 dense weights, NVMe-reside
 tables, DSpark speculative decoding, tool calling and vision**, behind one OpenAI-compatible
 endpoint.
 
-**Origin.** The skeleton of this recipe, the very beginning of it, is
-[0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000](https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000):
-native weights, NVMe Engram offload, DSpark, vision and the Docker/boot layout all come from
-there (one x86 box with four RTX PRO 6000, TP4/EP4). This repository remaps that recipe onto
-three arm64 Sparks (TP3/EP3 over RoCE, NFS-shared checkpoint) and adds the kernel routing,
-memory and correctness fixes the GB10 needed. Thanks to 0xSero for the groundwork.
-
 | | |
 |---|---|
 | Decode, 1 request | ~82 ms per speculative step, 35-50 tok/s depending on accept length |
