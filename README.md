@@ -19,6 +19,7 @@ endpoint.
 | Decode, prose, 2 / 3 / 4 streams | 58.9 / 71.2 / 78.6 tok/s aggregate (30.5 / 24.5 / 20.9 per stream), TTFT 424 / 311 / 383 ms |
 | Decode, 4 Sparks (TP=4), 1 / 2 / 4 / 8 / 16 streams | 45.4 / 72.9 / 103.1 / 114.1 / 134.2 tok/s aggregate (45.4 / 37.9 / 26.7 / 23.2 / 22.0 per stream), TTFT 212 / 232 / 270 ms, 2.70 / 12.45 s |
 | Prefill, 4 Sparks, 4K / 16K / 32K / 64K / 128K | 3,350 / 3,782 / 3,768 / 3,531 / 3,251 tok/s (TTFT 1.23 / 4.34 / 8.70 / 18.57 / 40.32 s) |
+| Context, 4 Sparks (TP=4) | 1M configured (model maximum) and verified: a 1M-context needle test passed with the shipped profile (1024-token chunks, 8M KV pin, 0.80 memory fraction) |
 | Context | 200k-256k limit configured (model max 1M); verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts; KV pool 750k tokens |
 | Memory left on the head while serving | ~6 GB (was <1 GB) |
 | Greedy decoding | deterministic run to run |
@@ -95,7 +96,7 @@ The profile ships with these defaults:
 
 | TP4 setting | Value | Why |
 |---|---|---|
-| `CONTEXT_LENGTH` | 1,048,576 | model maximum |
+| `CONTEXT_LENGTH` | 1,048,576 | model maximum; a 1M-context needle test passed at these settings |
 | `MAX_TOTAL_TOKENS` | 8,000,000 | 13.4 GB of KV per rank: 8 requests at ~1M tokens each; see below |
 | `MAX_RUNNING_REQUESTS` | 8 | also `--cuda-graph-max-bs-decode`: capture covers batch 1-8. Needs `--min-free-slots-delay 1` to be reachable; see below |
 | `CHUNKED_PREFILL_SIZE` | 1024 | ~15 GB peak indexer transient at 1M context (4096 would need ~60 GB); the size the long-context envelope was verified at |
@@ -105,17 +106,18 @@ The profile ships with these defaults:
 **The KV pin.** At TP4 the boot log's budget line — `DSV4 memory calculation:
 bytes_per_full_token=1670.75 ... full_token=` — reported room for ~16M tokens (~26.7 GB per
 rank) at `MEM_FRACTION_STATIC=0.90`. This profile runs 0.80, which takes ~13 GB off that
-budget, so expect the line to report roughly 8M: the 8,000,000 pin (13.4 GB of KV per rank)
-sits right under the linear estimate and has almost no margin. Read `full_token=` on the
-first boot and, if it comes in under the pin, lower the pin to what it reports rather than
-raising the fraction — the fraction is what keeps ~24 GiB per rank outside the static pool
-for the prefill transient. With `MAX_RUNNING_REQUESTS=8` the pool holds 8 requests averaging
-1,000,000 tokens each (8 × 1Mi = 8,388,608 would be the pin for all 8 at the full context).
-Two things to watch. **Long prefills:** the indexer's per-chunk transient peaks at about
-14 B × chunk × prefix (`docs/chunked-prefill-memory.md`): ~15 GB for a 1024-token chunk at
-1M context and ~60 GB for 4096, which is why the chunk is 1024. Ramp long prompts with
-`scripts/verify/memguard.py` before trusting 1M, and drop the chunk to 512 if the guard
-fires. **The budget is not fixed:** it is computed from `MemAvailable`
+budget, and pins 8,000,000 tokens (13.4 GB of KV per rank) under it. These settings are
+tested: the profile boots and serves as shipped. With `MAX_RUNNING_REQUESTS=8` the pool
+holds 8 requests averaging 1,000,000 tokens each (8 × 1Mi = 8,388,608 would be the pin for
+all 8 at the full context). The 0.80 fraction is what keeps ~24 GiB per rank outside the
+static pool for the prefill transient, so if the pool ever has to shrink, lower the pin
+rather than raise the fraction. **Long prefills:** the indexer's per-chunk transient peaks
+at about 14 B × chunk × prefix (`docs/chunked-prefill-memory.md`): ~15 GB for a 1024-token
+chunk at 1M context and ~60 GB for 4096, which is why the chunk is 1024. A 1M-context
+needle-in-a-haystack test passed on TP4 with these settings, so the 1M envelope is verified
+end to end rather than extrapolated; `scripts/verify/memguard.py` remains the tool for
+ramping new prompt shapes, and dropping the chunk to 512 is the lever if it ever fires.
+**The budget is not fixed:** it is computed from `MemAvailable`
 after weights, which moves with the page cache between identical boots, and a pin the budget
 cannot cover either kills the boot or is silently clamped down — both have been seen here.
 Read `full_token=` from the boot log after any change to weights, TP size or NCCL buffers.
@@ -147,7 +149,7 @@ What changes against the 3-node profile:
 | resident weights per rank | ~101 GiB | ~77 GiB |
 | free memory per rank while serving | ~6 GB | ~40 GB |
 | attention shards | heads padded 64→96, groups 8→12; rank 2 is all padding | exact: 16 heads, 2 groups per rank, no wasted GEMMs |
-| KV pool / context | 750k tokens / 256k limit, ~32k usable (memory-bound on the head) | 8M tokens (pinned) / 1M (model maximum) |
+| KV pool / context | 750k tokens / 256k limit, ~32k usable (memory-bound on the head) | 8M tokens (pinned) / 1M (model maximum; needle test passed at 1M) |
 | concurrency | 4 | 8 by default (measured to 16) |
 | NCCL per step | 104 collectives across 3 nodes | 104 collectives across 4 nodes (one more ring hop each) |
 | decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms | 45.4 tok/s, TTFT 212 ms |
