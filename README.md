@@ -17,6 +17,8 @@ endpoint.
 |---|---|
 | Decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms (~82 ms per speculative step) |
 | Decode, prose, 2 / 3 / 4 streams | 58.9 / 71.2 / 78.6 tok/s aggregate (30.5 / 24.5 / 20.9 per stream), TTFT 424 / 311 / 383 ms |
+| Decode, 4 Sparks (TP=4), 1 / 2 / 4 / 8 / 16 streams | 45.4 / 72.9 / 103.1 / 114.1 / 134.2 tok/s aggregate (45.4 / 37.9 / 26.7 / 23.2 / 22.0 per stream), TTFT 212 / 232 / 270 ms, 2.70 / 12.45 s |
+| Prefill, 4 Sparks, 4K / 16K / 32K / 64K / 128K | 3,350 / 3,782 / 3,768 / 3,531 / 3,251 tok/s (TTFT 1.23 / 4.34 / 8.70 / 18.57 / 40.32 s) |
 | Context | 200k-256k limit configured (model max 1M); verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts; KV pool 750k tokens |
 | Memory left on the head while serving | ~6 GB (was <1 GB) |
 | Greedy decoding | deterministic run to run |
@@ -88,16 +90,48 @@ Set `API_KEY` in `.env` to require a bearer token (`state/api-key` holds it).
 checkout can drive a 3-node and a 4-node fleet. Everything TP4-specific lives in
 `.env.tp4.example`: 4 workers (`WORKER_IPS`, `WORKER_HOSTS`, `NFS_SERVER_IPS`, one address
 for all workers behind a switch or one per worker), `TP_SIZE=EP_SIZE=4`, and a runtime sized
-for the ~40 GB per rank that TP4 leaves free (~77 GiB of weights per rank instead of ~101):
+for the ~40 GB per rank that TP4 leaves free (~77 GiB of weights per rank instead of ~101).
+The profile ships with these defaults:
 
 | TP4 setting | Value | Why |
 |---|---|---|
-| `CONTEXT_LENGTH` | 1,048,576 | model maximum; fits with ~10 GB of slack per rank |
-| `MAX_TOTAL_TOKENS` | 4,000,000 | 6.7 GB of KV per rank |
-| `MAX_RUNNING_REQUESTS` | 8 | CUDA graphs for batch 1-8 |
-| `CHUNKED_PREFILL_SIZE` | 4096 | indexer logits 4.3 GB per chunk at 1M context |
-| `MEM_FRACTION_STATIC` | 0.90 | keeps runtime slack for long prefills |
+| `CONTEXT_LENGTH` | 1,048,576 | model maximum |
+| `MAX_TOTAL_TOKENS` | 8,000,000 | 13.4 GB of KV per rank: 8 requests at ~1M tokens each; see below |
+| `MAX_RUNNING_REQUESTS` | 8 | also `--cuda-graph-max-bs-decode`: capture covers batch 1-8. Needs `--min-free-slots-delay 1` to be reachable; see below |
+| `CHUNKED_PREFILL_SIZE` | 1024 | ~15 GB peak indexer transient at 1M context (4096 would need ~60 GB); the size the long-context envelope was verified at |
+| `MEM_FRACTION_STATIC` | 0.80 | keeps ~24 GiB per rank outside the static pool for that transient |
 | `DSV41_TP_PAD` | 0 | heads, o_groups, draft experts and vocab all divide by 4: no padded shards |
+
+**The KV pin.** At TP4 the boot log's budget line — `DSV4 memory calculation:
+bytes_per_full_token=1670.75 ... full_token=` — reported room for ~16M tokens (~26.7 GB per
+rank) at `MEM_FRACTION_STATIC=0.90`. This profile runs 0.80, which takes ~13 GB off that
+budget, so expect the line to report roughly 8M: the 8,000,000 pin (13.4 GB of KV per rank)
+sits right under the linear estimate and has almost no margin. Read `full_token=` on the
+first boot and, if it comes in under the pin, lower the pin to what it reports rather than
+raising the fraction — the fraction is what keeps ~24 GiB per rank outside the static pool
+for the prefill transient. With `MAX_RUNNING_REQUESTS=8` the pool holds 8 requests averaging
+1,000,000 tokens each (8 × 1Mi = 8,388,608 would be the pin for all 8 at the full context).
+Two things to watch. **Long prefills:** the indexer's per-chunk transient peaks at about
+14 B × chunk × prefix (`docs/chunked-prefill-memory.md`): ~15 GB for a 1024-token chunk at
+1M context and ~60 GB for 4096, which is why the chunk is 1024. Ramp long prompts with
+`scripts/verify/memguard.py` before trusting 1M, and drop the chunk to 512 if the guard
+fires. **The budget is not fixed:** it is computed from `MemAvailable`
+after weights, which moves with the page cache between identical boots, and a pin the budget
+cannot cover either kills the boot or is silently clamped down — both have been seen here.
+Read `full_token=` from the boot log after any change to weights, TP size or NCCL buffers.
+KV pages are touched only when used, so the pool costs nothing until it fills.
+
+**Admission at concurrency 8.** SGLang classifies DSpark as DFlash-family
+(`is_dflash_family = is_dflash or is_dspark`), and for that family with
+`--max-running-requests >= 8` it auto-enables an admission delayer that holds new prefills
+until `min(4, max(2, (max_running_requests + 5) // 6))` slots are free — 2 at 8 requests, 3
+at 16. Under steady arrivals the running batch then never sustains the configured maximum:
+about 7 of 8, about 13–14 of 16. The TP4 profile passes `--min-free-slots-delay 1` (an
+explicit value wins; ≤1 disables) so 8 means 8. The TP3 profile is unaffected — the
+formula is off below 8 running requests. Credit for finding this: reported publicly against
+the 3-Spark recipe, with +43% aggregate at 8 streams; the mechanism is verified here against
+`srt/managers/min_free_slots_delayer.py`, the throughput number is not yet reproduced on our
+fleet.
 
 ```bash
 cp -n .env.tp4.example .env.tp4      # IPs, ssh user, NFS addresses
@@ -113,9 +147,43 @@ What changes against the 3-node profile:
 | resident weights per rank | ~101 GiB | ~77 GiB |
 | free memory per rank while serving | ~6 GB | ~40 GB |
 | attention shards | heads padded 64→96, groups 8→12; rank 2 is all padding | exact: 16 heads, 2 groups per rank, no wasted GEMMs |
-| KV pool / context | 750k tokens / 256k limit, ~32k usable (memory-bound on the head) | 4M tokens / 1M (model maximum) |
-| concurrency | 4 | 8 |
+| KV pool / context | 750k tokens / 256k limit, ~32k usable (memory-bound on the head) | 8M tokens (pinned) / 1M (model maximum) |
+| concurrency | 4 | 8 by default (measured to 16) |
 | NCCL per step | 104 collectives across 3 nodes | 104 collectives across 4 nodes (one more ring hop each) |
+| decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms | 45.4 tok/s, TTFT 212 ms |
+| decode, prose, 4 streams | 78.6 tok/s agg (20.9 per stream), TTFT 383 ms | 103.1 tok/s agg (26.7 per stream), TTFT 270 ms |
+
+Measured on 4× DGX Spark with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (prose
+decode, 256 completion tokens; prefill at 4K–128K). Decode is faster than the 3-node fleet at every concurrency — smaller
+attention GEMMs per rank and no padded shards more than pay for the extra NCCL hop.
+The memory headroom is what makes the 1M context possible. Decode has been measured out to
+16 streams (with `MAX_RUNNING_REQUESTS=16`): aggregate throughput is still climbing there
+(134.2 tok/s) but per-stream rate has flattened at ~22 tok/s and TTFT degrades sharply past
+4 streams — 2.70 s at 8, 12.45 s at 16 — as prefills queue behind each other. Concurrency 16
+is a throughput operating point, not a latency one; the profile defaults to 8, and raising
+`MAX_RUNNING_REQUESTS` (with the KV pin to match) is how to get the 16-stream point back.
+
+**Decode** (prose, 256 tok):
+
+| load | TTFT | aggregate | per stream |
+|---|---:|---:|---:|
+| ×1 | 212 ms | 45.4 tok/s | 45.4 tok/s |
+| ×2 | 232 ms | 72.9 tok/s | 37.9 tok/s |
+| ×4 | 270 ms | 103.1 tok/s | 26.7 tok/s |
+| ×8 | 2.70 s | 114.1 tok/s | 23.2 tok/s |
+| ×16 | 12.45 s | 134.2 tok/s | 22.0 tok/s |
+
+**Prefill:**
+
+| context | prompt tokens | TTFT | prefill |
+|---|---:|---:|---:|
+| 4K | 4,118 | 1.23 s | 3,350 tok/s |
+| 16K | 16,400 | 4.34 s | 3,782 tok/s |
+| 32K | 32,788 | 8.70 s | 3,768 tok/s |
+| 64K | 65,557 | 18.57 s | 3,531 tok/s |
+| 128K | 131,093 | 40.32 s | 3,251 tok/s |
+
+Prefill peaks at ~3.8k tok/s around 16–32K and is still 3.2k at 128K.
 
 Fabric: a Spark has two ConnectX-7 ports, so three nodes form a full triangle but four
 cannot; a 4-node fleet needs a RoCE switch (all NCCL and NFS traffic through it, one
@@ -132,12 +200,6 @@ The control scripts take any number of workers (`WORKER_IPS`/`WORKER_HOSTS` list
 legacy `WORKER1_IP`/`WORKER2_IP` pairs still work), so 5+ nodes only need a matching
 `TP_SIZE` and `NNODES`. Nothing in the image is TP-specific; the padded-shard repair simply
 finds nothing to repair at TP4.
-
-Every measurement in this README comes from the 3-node fleet; the TP4 profile has been
-validated for configuration and script paths only (`./start-tp4.sh doctor`), not booted.
-Expect the same per-step structure (dense GEMMs, MoE, NCCL) with smaller attention GEMMs
-per rank and one extra network hop per collective; the memory headroom is what makes the
-long context and the higher concurrency safe, not a faster step.
 
 ## What is in the box
 
@@ -282,6 +344,9 @@ fails), and the head has little RAM to spare.
 - Measure decode as `usage.completion_tokens / elapsed` on non-streaming requests or from the
   `gen throughput` field of `Decode batch` log lines; counting SSE chunks under-reports ~3.5×
   because each chunk carries a whole accepted speculative block.
+- The TP4 decode and prefill tables above were produced with
+  [sparkDash](https://github.com/MiaAI-Lab/sparkDash), which drives the OpenAI endpoint at a
+  fixed stream count and reports aggregate and per-stream rates alongside TTFT.
 - `./start.sh build` rsyncs the repo to the workers with `--delete`; `engram/` and the state,
   logs and `.env` are excluded. Do not edit `start.sh` while a `./start.sh` command is running
   (bash reads scripts incrementally).
