@@ -125,7 +125,7 @@ def request(path, payload=None, timeout=10):
 
 def smoke():
     result = request('/v1/chat/completions', dict(
-        model=SERVED_MODEL_NAME, temperature=0,
+        model=SERVED_MODEL_NAME, temperature=0, max_tokens=32,
         chat_template_kwargs={'thinking': False},
         messages=[dict(role='user', content='What is 19 + 23? Reply only with the number.')]),
         timeout=300)
@@ -135,7 +135,7 @@ def smoke():
     print('Fresh inference passed: 19 + 23 = 42', flush=True)
     if os.environ.get('SMOKE_QUICK', '0') == '1':
         return
-    common = dict(model=SERVED_MODEL_NAME, temperature=0,
+    common = dict(model=SERVED_MODEL_NAME, temperature=0, max_tokens=256,
                   chat_template_kwargs={'thinking': False})
     structured = request('/v1/chat/completions', dict(common,
         messages=[dict(role='user', content='Return an object whose answer is the integer 42.')],

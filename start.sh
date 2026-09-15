@@ -125,7 +125,7 @@ MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-4}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-320000}"
 SPEC_ALGO="${SPEC_ALGO:-DSPARK}"
-DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-5}"
+DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v4.1-flash}"
 SKIP_PREPARE="${SKIP_PREPARE:-1}"
 SKIP_VERIFY="${SKIP_VERIFY:-1}"
@@ -300,6 +300,12 @@ docker_common_args() {
     -e "NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT}"
     -e "DSV41_MXFP8_BACKEND=${DSV41_MXFP8_BACKEND:-b12x}"
     -e "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=${SGLANG_FLASHINFER_MOE_FUSED_FINALIZE:-1}"
+    -e "SGLANG_DSV41_REASONING_EFFORT=${SGLANG_DSV41_REASONING_EFFORT:-75}"
+    -e "DSV41_MAX_NEW_TOKENS=${DSV41_MAX_NEW_TOKENS:-32768}"
+    -e "DSV41_LOOP_ABORT=${DSV41_LOOP_ABORT:-1}"
+    -e "DSV41_LOOP_NGRAM=${DSV41_LOOP_NGRAM:-32}"
+    -e "DSV41_LOOP_REPEATS=${DSV41_LOOP_REPEATS:-4}"
+    -e "DSV41_LOOP_LINE_REPEATS=${DSV41_LOOP_LINE_REPEATS:-8}"
     -e "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
     -e "CUDA_DEVICE_ORDER=PCI_BUS_ID"
     -e "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=0"
@@ -384,6 +390,12 @@ worker_env_lines() {
         -e NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT} \\
         -e DSV41_MXFP8_BACKEND=${DSV41_MXFP8_BACKEND:-b12x} \\
         -e SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=${SGLANG_FLASHINFER_MOE_FUSED_FINALIZE:-1} \\
+        -e SGLANG_DSV41_REASONING_EFFORT=${SGLANG_DSV41_REASONING_EFFORT:-75} \\
+        -e DSV41_MAX_NEW_TOKENS=${DSV41_MAX_NEW_TOKENS:-32768} \\
+        -e DSV41_LOOP_ABORT=${DSV41_LOOP_ABORT:-1} \\
+        -e DSV41_LOOP_NGRAM=${DSV41_LOOP_NGRAM:-32} \\
+        -e DSV41_LOOP_REPEATS=${DSV41_LOOP_REPEATS:-4} \\
+        -e DSV41_LOOP_LINE_REPEATS=${DSV41_LOOP_LINE_REPEATS:-8} \\
         -e PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False} \\
         -e NCCL_IB_GID_INDEX=$wgid \\
         -e CUDA_DEVICE_ORDER=PCI_BUS_ID \\
@@ -734,7 +746,7 @@ $(worker_env_lines "$wip" "$wgid" "$rank")
       else
         echo "    -H 'Content-Type: application/json' \\"
       fi
-      echo "    -d '{\"model\":\"$SERVED_MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 19 + 23?\"}],\"chat_template_kwargs\":{\"thinking\":false}}'"
+      echo "    -d '{\"model\":\"$SERVED_MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 19 + 23?\"}],\"max_tokens\":32,\"chat_template_kwargs\":{\"thinking\":false}}'"
       echo
       [[ -n "$API_KEY" ]] && echo "  key:  $STATE_DIR/api-key" || echo "  auth: none (no API key)"
       echo "  logs: ./start.sh logs | ./start.sh logs -f | ./start.sh logs worker1"
@@ -810,7 +822,7 @@ cmd_smoke() {
   info "smoke: 19+23 (thinking off)"
   curl -fsS --max-time 180 "http://127.0.0.1:${PORT}/v1/chat/completions" \
     "${auth[@]}" -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$SERVED_MODEL_NAME\",\"temperature\":0,\"chat_template_kwargs\":{\"thinking\":false},\"messages\":[{\"role\":\"user\",\"content\":\"What is 19 + 23? Reply only with the number.\"}]}"
+    -d "{\"model\":\"$SERVED_MODEL_NAME\",\"temperature\":0,\"max_tokens\":32,\"chat_template_kwargs\":{\"thinking\":false},\"messages\":[{\"role\":\"user\",\"content\":\"What is 19 + 23? Reply only with the number.\"}]}"
   echo
 }
 
