@@ -79,8 +79,10 @@ CUDA-graph capture). `./start.sh status`, `./start.sh logs [worker1|worker2] [N]
 ```bash
 curl http://10.0.0.1:8888/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"What is 19 + 23?"}],
-       "chat_template_kwargs":{"thinking":false}}'
+       "max_tokens":32, "chat_template_kwargs":{"thinking":false}}'
 ```
+
+`enable_thinking` is accepted as an alias for `thinking` (vLLM / EXL3 clients). Either key turns thinking off; if both are set and disagree, `thinking` wins. Always send `max_tokens` (the EXL3 recipe does this on every smoke). Requests that omit it are filled and clamped at `DSV41_MAX_NEW_TOKENS` (default 32768) so a generation loop cannot run to the 1M context. A live token stream also cannot spin forever: an n-gram or same-line repeat aborts the request (see `DSV41_LOOP_*`). `--watchdog-timeout 1800` does not fire while tokens keep arriving.
 
 Set `API_KEY` in `.env` to require a bearer token (`state/api-key` holds it).
 
@@ -212,6 +214,8 @@ boot.py                  in-container entrypoint: download+verify (optional), la
 Dockerfile               lmsysorg/sglang:dev-dsv41 (arm64) + adapter/ + runtime/ overlay
 adapter/
   sitecustomize.py       import hooks that install the pieces below at process start
+  encoding_compat.py     enable_thinking alias, publisher effort table, max_tokens cap
+  loop_abort.py          n-gram / identical-token / same-line stop on a live decode loop
   tp3_pad.py             TP=3 padding of heads / groups / vocab / draft experts
   engram_backend.py      EngramEmbedding replacement: exact rows from NVMe via a host callback
   row_store.cpp          the row store: O_DIRECT reads, 96-thread miss servicing, packed shards
@@ -222,7 +226,7 @@ runtime/flash_mla_sm120.py  SM12x sparse-MLA dispatch (64-token page split for F
 scripts/pack_engram.py   repack one rank's Engram rows (weight+scale adjacent) to local disk
 scripts/profile/         torch-profiler helper and trace analysers (see Profiling)
 files/                   NFS export helpers
-benchmarks/, tests/      upstream benchmark and row-store tests
+benchmarks/, tests/      upstream benchmark, row-store, thinking-alias, encoder-parity, max-tokens and loop-abort tests
 ```
 
 ## Knobs (`.env`)
@@ -234,11 +238,16 @@ benchmarks/, tests/      upstream benchmark and row-store tests
 | `MAX_TOTAL_TOKENS` | 750000 | KV pool, pinned. 1,670.75 B/token/rank; see *Memory* |
 | `MAX_RUNNING_REQUESTS` | 4 | also the CUDA-graph batch tiers (1-4) |
 | `MEM_FRACTION_STATIC` | 0.95 | ≥0.944 needed; lowering it does not free RAM, it only starves KV |
-| `SPEC_ALGO` / `DSPARK_BLOCK_SIZE` | DSPARK / 5 | 6-token verify window; `off` disables speculation |
+| `SPEC_ALGO` / `DSPARK_BLOCK_SIZE` | DSPARK / 3 | 4-token verify window (1+k). k=5 over-drafts on chat/prose; TP3 ×1 greedy prose was 22.3→25.4 tok/s. Decode tables below were measured at k=5. `off` disables speculation |
 | `DSPARK_SPS_TABLE` | /state/dspark_sps.json | profiled cost table; enables compact ragged verify when present |
 | `EXTRA_SGLANG_ARGS` | `--fp8-gemm-backend flashinfer_cutlass --watchdog-timeout 1800` | required for the MXFP8 route (below) |
 | `DSV41_MXFP8_BACKEND` | b12x | FlashInfer kernel for the FP8 dense projections: `b12x`, `cudnn`, `cutlass` |
 | `SGLANG_FLASHINFER_MOE_FUSED_FINALIZE` | 0 | keep 0: the fused (atomic) finalize is nondeterministic |
+| `SGLANG_DSV41_REASONING_EFFORT` | 75 | default budget for thinking-mode requests without a `reasoning_effort`. SGLang's V4.1 encoder maps `low`/`high`/`xhigh`/`max` to 25/50/75/100 and defaults to `high` = 50; the publisher's `encoding.py` says 50/75/100, default 75. The adapter remaps the tiers; this pins the default. Integer 1-100; see *Correctness notes* |
+| `DSV41_MAX_NEW_TOKENS` | 32768 | fill-in and hard cap when a chat request omits `max_tokens` / `max_completion_tokens`, or asks for more. 0 leaves SGLang's remaining-context default (how VIS-04 ran to 714k tokens). |
+| `DSV41_LOOP_ABORT` | 1 | stop a request whose output is an n-gram cycle, a same-token run, or the same decoded line repeated. `finish_reason=stop` / `matched=repetition`. 0 disables. The 2× EXL3 recipe has no equivalent; `--watchdog-timeout` does not fire on a live stream. |
+| `DSV41_LOOP_NGRAM` / `DSV41_LOOP_REPEATS` | 32 / 4 | minimum cycle length in tokens, and consecutive copies required (keeps one copy). |
+| `DSV41_LOOP_LINE_REPEATS` | 8 | identical decoded lines of at least 16 characters. 0 disables the line detector. |
 | `NCCL_BUFFSIZE` / `NCCL_LL128_BUFFSIZE` / `NCCL_PROTO` / `NCCL_MAX_NCHANNELS` | 1 MiB / 256 KiB / `^LL128` / 8 | NCCL connection buffers: 4.7 GiB → 0.14 GiB pinned per node |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:False` | never `True`: with expandable segments every prefill of more than 64 query tokens returns NaN logits (garbage for prompts of 65-~4000 tokens and for 3+ concurrent requests; REPORT.md §17). The native allocator fragments on long prompts, hence the context cap |
 | `DSV41_PREFILL_EMPTY_CACHE_TOKENS` | 8192 | `adapter/prefill_empty_cache.py`: after each prefill chunk of a sequence this long or longer, give the allocator's cached blocks back so a long prompt costs one chunk's transient, not the sum (REPORT.md §17). 0 disables |
@@ -318,6 +327,33 @@ Where the 118 → 82 ms came from, in order of size:
   length tested; cost ~0.3 ms per step. Batches at concurrency >1 can still differ between
   runs because batch composition changes which GEMM tiles run; that is normal SGLang
   behaviour without `--enable-deterministic-inference`.
+- **Reasoning budget.** DeepSeek-V4.1 takes a numeric reasoning effort (1-100) as a prompt
+  prefix in thinking mode. SGLang's built-in V4.1 encoder maps the named tiers
+  `low`/`high`/`xhigh`/`max` to 25/50/75/100 and defaults to `high`, so every thinking request
+  ran at budget 50 and `low` meant 25; the publisher's `encoding/encoding.py` maps
+  `low`/`high`/`max` to 50/75/100 with default 75 (evaluations used 100). `adapter/encoding_compat.py`
+  remaps the tiers to the publisher's table (`xhigh` kept as an alias for 75) and
+  `SGLANG_DSV41_REASONING_EFFORT=75` pins the default. Per request: the OpenAI `reasoning_effort`
+  field (a tier, or a 0-0.99 float = budget/100) or `"chat_template_kwargs":{"reasoning_effort":N}`;
+  `medium` is not a V4.1 tier and falls back to the default with a warning. The budget changes
+  reasoning length and DSpark acceptance, so state it with any thinking-mode number; the decode
+  tables in this README are thinking-off. Same correction as local-inference-lab/rtx6kpro R37.
+- **Thinking toggle.** SGLang reads `chat_template_kwargs.thinking`. vLLM-style
+  `enable_thinking` is copied onto `thinking` before encode/parse, so either name works.
+  `python3 tests/test_thinking_alias.py` covers the alias; `python3 tests/test_chat_encoding.py`
+  diffs tool and thinking-off renders against the checkpoint's `encoding/encoding.py` (and
+  against SGLang's `encoding_dsv41` inside the image).
+- **Completion cap.** Chat requests that omit `max_tokens` fill the remaining context on
+  this OpenAI path. The 2× EXL3 recipe has no server-side cap either (vLLM does the same
+  fill) but every one of its smokes and README curls sends `max_tokens`. This recipe now
+  does both: examples send `max_tokens`, and `adapter/encoding_compat.py` fills/clamps at
+  `DSV41_MAX_NEW_TOKENS` (default 32768). Set it to 0 to replay an uncapped harness.
+- **Loop abort.** VIS-04 was a semantic loop, not a hung GPU: 714k tokens over ~2.6 h while
+  `--watchdog-timeout 1800` stayed quiet. `adapter/loop_abort.py` finishes the request after
+  four consecutive copies of a ≥32-token n-gram, 64 identical tokens, or eight identical
+  decoded lines, with OpenAI `finish_reason=stop` (`matched=repetition`). The 2× EXL3 recipe
+  has no decode-side detector. `python3 tests/test_loop_abort.py` covers the detector; set
+  `DSV41_LOOP_ABORT=0` to turn it off.
 - `runtime/flash_mla_sm120.py` sends prefills of more than 64 query tokens to FlashInfer's
   sparse-prefill specialisation and everything else through the decode kernel with a
   256→64-token page split; both paths were verified deterministic.
