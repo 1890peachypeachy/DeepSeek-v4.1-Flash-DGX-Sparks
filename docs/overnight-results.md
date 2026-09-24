@@ -203,3 +203,16 @@ scripts/profile/profile_decode.sh 45 /tmp/prof
    change), the newer da64c5cbb/canary image as a whole-fleet upgrade, more request slots / C8,
    SPS/STS tables, folded-result fence, per-position cap thresholds, k=4 + cap.
 
+## After the campaign: long-prompt crash and chunk size (2026-09-24 afternoon)
+
+In normal use of the final configuration, a single new prompt of at least ~200k tokens ran spark1
+out of memory during prefill (1024-token chunks; first `NV_ERR_NO_MEMORY` at 13:23, host hung until
+a hard reset at 14:05). The KV cache was only ~31 % full: the per-chunk indexer transient was the
+peak. The campaign's long-context check had stopped at 191k, so the range 191k-262k was never
+validated on this stack, and no memory guard was running.
+
+Change: `CHUNKED_PREFILL_SIZE=768` (default in `.env.example`). The next boot got the 750k KV pin
+with a 1.24M budget and the head at ~5.2 GB `MemAvailable` (was ~2 GB). Not yet measured: the
+largest prompt that is safe at 768, and whether EP1 or the larger KV cache lowered the ceiling
+compared with the pre-campaign configuration (208k verified there, 256k failed). Until that is
+measured, run `scripts/verify/memguard.py` on the head for long-context work.
