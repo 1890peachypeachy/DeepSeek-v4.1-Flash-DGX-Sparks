@@ -15,9 +15,12 @@ endpoint.
 
 | | |
 |---|---|
-| Decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms (~82 ms per speculative step) |
-| Decode, prose, 2 / 3 / 4 streams | 58.9 / 71.2 / 78.6 tok/s aggregate (30.5 / 24.5 / 20.9 per stream), TTFT 424 / 311 / 383 ms |
-| Context | 200k-256k limit configured (model max 1M); verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts; KV pool 750k tokens |
+| Decode, prose, 1 stream | 51.0 tok/s, TTFT 223 ms (~59 ms per speculative step) |
+| Decode, prose, 2 / 4 streams | 75.1 / 85.4 tok/s aggregate (39.0 / 22.8 per stream), TTFT 290 / 356 ms |
+| Decode, 4 Sparks (TP=4), 1 / 2 / 4 / 8 / 16 streams | 45.4 / 72.9 / 103.1 / 114.1 / 134.2 tok/s aggregate (45.4 / 37.9 / 26.7 / 23.2 / 22.0 per stream), TTFT 212 / 232 / 270 ms, 2.70 / 12.45 s |
+| Prefill, 4 Sparks, 4K / 16K / 32K / 64K / 128K | 3,350 / 3,782 / 3,768 / 3,531 / 3,251 tok/s (TTFT 1.23 / 4.34 / 8.70 / 18.57 / 40.32 s) |
+| Context, 4 Sparks (TP=4) | 1M configured (model maximum) and verified: a 1M-context needle test passed with the shipped profile (1024-token chunks, 8M KV pin, 0.80 memory fraction) |
+| Context | 256k limit configured (model max 1M). Verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts. With the 2026-09-24 decode stack a ~200k prompt at 1024 exhausted the head, so chunks are now 768 (191k verified before that change); KV pool 750k tokens |
 | Memory left on the head while serving | ~6 GB (was <1 GB) |
 | Greedy decoding | deterministic run to run |
 
@@ -76,8 +79,10 @@ CUDA-graph capture). `./start.sh status`, `./start.sh logs [worker1|worker2] [N]
 ```bash
 curl http://10.0.0.1:8888/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"What is 19 + 23?"}],
-       "chat_template_kwargs":{"thinking":false}}'
+       "max_tokens":32, "chat_template_kwargs":{"thinking":false}}'
 ```
+
+`enable_thinking` is accepted as an alias for `thinking` (vLLM / EXL3 clients). Either key turns thinking off; if both are set and disagree, `thinking` wins. Always send `max_tokens` (the EXL3 recipe does this on every smoke). Requests that omit it are filled and clamped at `DSV41_MAX_NEW_TOKENS` (default 32768) so a generation loop cannot run to the 1M context. A live token stream also cannot spin forever: an n-gram or same-line repeat aborts the request (see `DSV41_LOOP_*`). `--watchdog-timeout 1800` does not fire while tokens keep arriving.
 
 Set `API_KEY` in `.env` to require a bearer token (`state/api-key` holds it).
 
@@ -88,16 +93,49 @@ Set `API_KEY` in `.env` to require a bearer token (`state/api-key` holds it).
 checkout can drive a 3-node and a 4-node fleet. Everything TP4-specific lives in
 `.env.tp4.example`: 4 workers (`WORKER_IPS`, `WORKER_HOSTS`, `NFS_SERVER_IPS`, one address
 for all workers behind a switch or one per worker), `TP_SIZE=EP_SIZE=4`, and a runtime sized
-for the ~40 GB per rank that TP4 leaves free (~77 GiB of weights per rank instead of ~101):
+for the ~40 GB per rank that TP4 leaves free (~77 GiB of weights per rank instead of ~101).
+The profile ships with these defaults:
 
 | TP4 setting | Value | Why |
 |---|---|---|
-| `CONTEXT_LENGTH` | 1,048,576 | model maximum; fits with ~10 GB of slack per rank |
-| `MAX_TOTAL_TOKENS` | 4,000,000 | 6.7 GB of KV per rank |
-| `MAX_RUNNING_REQUESTS` | 8 | CUDA graphs for batch 1-8 |
-| `CHUNKED_PREFILL_SIZE` | 4096 | indexer logits 4.3 GB per chunk at 1M context |
-| `MEM_FRACTION_STATIC` | 0.90 | keeps runtime slack for long prefills |
+| `CONTEXT_LENGTH` | 1,048,576 | model maximum; a 1M-context needle test passed at these settings |
+| `MAX_TOTAL_TOKENS` | 8,000,000 | 13.4 GB of KV per rank: 8 requests at ~1M tokens each; see below |
+| `MAX_RUNNING_REQUESTS` | 8 | also `--cuda-graph-max-bs-decode`: capture covers batch 1-8. Needs `--min-free-slots-delay 1` to be reachable; see below |
+| `CHUNKED_PREFILL_SIZE` | 1024 | ~15 GB peak indexer transient at 1M context (4096 would need ~60 GB); the size the long-context envelope was verified at |
+| `MEM_FRACTION_STATIC` | 0.80 | keeps ~24 GiB per rank outside the static pool for that transient |
 | `DSV41_TP_PAD` | 0 | heads, o_groups, draft experts and vocab all divide by 4: no padded shards |
+
+**The KV pin.** At TP4 the boot log's budget line — `DSV4 memory calculation:
+bytes_per_full_token=1670.75 ... full_token=` — reported room for ~16M tokens (~26.7 GB per
+rank) at `MEM_FRACTION_STATIC=0.90`. This profile runs 0.80, which takes ~13 GB off that
+budget, and pins 8,000,000 tokens (13.4 GB of KV per rank) under it. These settings are
+tested: the profile boots and serves as shipped. With `MAX_RUNNING_REQUESTS=8` the pool
+holds 8 requests averaging 1,000,000 tokens each (8 × 1Mi = 8,388,608 would be the pin for
+all 8 at the full context). The 0.80 fraction is what keeps ~24 GiB per rank outside the
+static pool for the prefill transient, so if the pool ever has to shrink, lower the pin
+rather than raise the fraction. **Long prefills:** the indexer's per-chunk transient peaks
+at about 14 B × chunk × prefix (`docs/chunked-prefill-memory.md`): ~15 GB for a 1024-token
+chunk at 1M context and ~60 GB for 4096, which is why the chunk is 1024. A 1M-context
+needle-in-a-haystack test passed on TP4 with these settings, so the 1M envelope is verified
+end to end rather than extrapolated; `scripts/verify/memguard.py` remains the tool for
+ramping new prompt shapes, and dropping the chunk to 512 is the lever if it ever fires.
+**The budget is not fixed:** it is computed from `MemAvailable`
+after weights, which moves with the page cache between identical boots, and a pin the budget
+cannot cover either kills the boot or is silently clamped down — both have been seen here.
+Read `full_token=` from the boot log after any change to weights, TP size or NCCL buffers.
+KV pages are touched only when used, so the pool costs nothing until it fills.
+
+**Admission at concurrency 8.** SGLang classifies DSpark as DFlash-family
+(`is_dflash_family = is_dflash or is_dspark`), and for that family with
+`--max-running-requests >= 8` it auto-enables an admission delayer that holds new prefills
+until `min(4, max(2, (max_running_requests + 5) // 6))` slots are free — 2 at 8 requests, 3
+at 16. Under steady arrivals the running batch then never sustains the configured maximum:
+about 7 of 8, about 13–14 of 16. The TP4 profile passes `--min-free-slots-delay 1` (an
+explicit value wins; ≤1 disables) so 8 means 8. The TP3 profile is unaffected — the
+formula is off below 8 running requests. Credit for finding this: reported publicly against
+the 3-Spark recipe, with +43% aggregate at 8 streams; the mechanism is verified here against
+`srt/managers/min_free_slots_delayer.py`, the throughput number is not yet reproduced on our
+fleet.
 
 ```bash
 cp -n .env.tp4.example .env.tp4      # IPs, ssh user, NFS addresses
@@ -113,16 +151,60 @@ What changes against the 3-node profile:
 | resident weights per rank | ~101 GiB | ~77 GiB |
 | free memory per rank while serving | ~6 GB | ~40 GB |
 | attention shards | heads padded 64→96, groups 8→12; rank 2 is all padding | exact: 16 heads, 2 groups per rank, no wasted GEMMs |
-| KV pool / context | 750k tokens / 256k limit, ~32k usable (memory-bound on the head) | 4M tokens / 1M (model maximum) |
-| concurrency | 4 | 8 |
+| KV pool / context | 750k tokens / 256k limit, ~32k usable (memory-bound on the head) | 8M tokens (pinned) / 1M (model maximum; needle test passed at 1M) |
+| concurrency | 4 | 8 by default (measured to 16) |
 | NCCL per step | 104 collectives across 3 nodes | 104 collectives across 4 nodes (one more ring hop each) |
+| decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms | 45.4 tok/s, TTFT 212 ms |
+| decode, prose, 4 streams | 78.6 tok/s agg (20.9 per stream), TTFT 383 ms | 103.1 tok/s agg (26.7 per stream), TTFT 270 ms |
+
+Measured on 4× DGX Spark with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (prose
+decode, 256 completion tokens; prefill at 4K–128K). Decode is faster than the 3-node fleet at every concurrency — smaller
+attention GEMMs per rank and no padded shards more than pay for the extra NCCL hop.
+An independent switchless-ring reproduction (public OpenAI path, idle cluster,
+greedy code, estimated decode window 129–641) is in
+[`docs/tp4-switchless-ring-results.md`](docs/tp4-switchless-ring-results.md): C1 window
+67.4 tok/s estimated, C8 aggregate 224.8 tok/s (historical DSpark k=5; current
+default remains k=3).
+The memory headroom is what makes the 1M context possible. Decode has been measured out to
+16 streams (with `MAX_RUNNING_REQUESTS=16`): aggregate throughput is still climbing there
+(134.2 tok/s) but per-stream rate has flattened at ~22 tok/s and TTFT degrades sharply past
+4 streams — 2.70 s at 8, 12.45 s at 16 — as prefills queue behind each other. Concurrency 16
+is a throughput operating point, not a latency one; the profile defaults to 8, and raising
+`MAX_RUNNING_REQUESTS` (with the KV pin to match) is how to get the 16-stream point back.
+
+**Decode** (prose, 256 tok):
+
+| load | TTFT | aggregate | per stream |
+|---|---:|---:|---:|
+| ×1 | 212 ms | 45.4 tok/s | 45.4 tok/s |
+| ×2 | 232 ms | 72.9 tok/s | 37.9 tok/s |
+| ×4 | 270 ms | 103.1 tok/s | 26.7 tok/s |
+| ×8 | 2.70 s | 114.1 tok/s | 23.2 tok/s |
+| ×16 | 12.45 s | 134.2 tok/s | 22.0 tok/s |
+
+**Prefill:**
+
+| context | prompt tokens | TTFT | prefill |
+|---|---:|---:|---:|
+| 4K | 4,118 | 1.23 s | 3,350 tok/s |
+| 16K | 16,400 | 4.34 s | 3,782 tok/s |
+| 32K | 32,788 | 8.70 s | 3,768 tok/s |
+| 64K | 65,557 | 18.57 s | 3,531 tok/s |
+| 128K | 131,093 | 40.32 s | 3,251 tok/s |
+
+Prefill peaks at ~3.8k tok/s around 16–32K and is still 3.2k at 128K.
 
 Fabric: a Spark has two ConnectX-7 ports, so three nodes form a full triangle but four
-cannot; a 4-node fleet needs a RoCE switch (all NCCL and NFS traffic through it, one
-`NFS_SERVER_IPS` address) or a ring with NCCL routed over it. Set `NCCL_IB_HCA`,
-`NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME`, `NFS_CLIENTS` and the GID index in `.env.tp4` for
-that fabric; `./start-tp4.sh doctor` checks reachability and the NFS mounts before a
-13-minute boot. `NCCL_DEBUG=INFO` for one boot shows the channels and protocol chosen.
+cannot. A 4-node fleet needs either a RoCE switch, or the opt-in switchless-ring path in
+[`docs/switchless-ring.md`](docs/switchless-ring.md). The latter requires four DACs, one
+point-to-point subnet per cable, the patched `sparkring` NCCL on every rank, and
+`NCCL_SWITCHLESS_RING_ONLY=1`; setting only environment variables against stock NCCL is not
+enough. The guide includes physical cable diagrams, IP examples, patched-library verification,
+local-weight operation and the exact logs that prove Tree/PAT setup was skipped. For a switched
+fleet, route NCCL/NFS through the switch and use one `NFS_SERVER_IPS` address. In either layout,
+set `IB_HCA`, `NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME`, `NFS_CLIENTS` and the GID index in
+`.env.tp4`; `./start-tp4.sh doctor` validates the selected path before the cold boot.
+`NCCL_DEBUG=INFO` for one boot shows the channels and protocol chosen.
 
 Engram: `./start-tp4.sh pack` writes each rank's rows as `engram-l<layer>-r<rank>of4.bin`
 (~48 GiB per node at TP4) onto local NVMe; the names carry the TP size, so `ENGRAM_DIR` can
@@ -133,48 +215,62 @@ legacy `WORKER1_IP`/`WORKER2_IP` pairs still work), so 5+ nodes only need a matc
 `TP_SIZE` and `NNODES`. Nothing in the image is TP-specific; the padded-shard repair simply
 finds nothing to repair at TP4.
 
-Every measurement in this README comes from the 3-node fleet; the TP4 profile has been
-validated for configuration and script paths only (`./start-tp4.sh doctor`), not booted.
-Expect the same per-step structure (dense GEMMs, MoE, NCCL) with smaller attention GEMMs
-per rank and one extra network hop per collective; the memory headroom is what makes the
-long context and the higher concurrency safe, not a faster step.
-
 ## What is in the box
 
 ```
 start.sh                 doctor / build / share / pack / serve / stop / status / logs / smoke
 start-tp4.sh             same commands for 4 Sparks (profile: .env.tp4, state-tp4/, logs-tp4/)
 boot.py                  in-container entrypoint: download+verify (optional), launch, smoke
-Dockerfile               lmsysorg/sglang:dev-dsv41 (arm64) + adapter/ + runtime/ overlay
+Dockerfile               lmsysorg/sglang:dev-dsv41 pinned by digest (sha256:3dbc3130…, arm64) + adapter/ + runtime/ overlay
 adapter/
   sitecustomize.py       import hooks that install the pieces below at process start
+  encoding_compat.py     enable_thinking alias, publisher effort table, max_tokens cap
+  loop_abort.py          n-gram / identical-token / same-line stop on a live decode loop
   tp3_pad.py             TP=3 padding of heads / groups / vocab / draft experts
   engram_backend.py      EngramEmbedding replacement: exact rows from NVMe via a host callback
   row_store.cpp          the row store: O_DIRECT reads, 96-thread miss servicing, packed shards
   mxfp8_b12x.py          routes MXFP8 dense linears to FlashInfer's b12x kernel; repairs the
                          block scales of padded shards
   prefill_empty_cache.py empties the allocator cache after each long prefill chunk (memory)
+  wo_a_w8.py             fp8 twin of wo_a (W8 / MID / DROP)            } from knapcio's TP4 fork,
+  verify_cap.py          confidence cap on the DSpark verify window     } see Attribution:
+  block_verify.py        block verification for sampled rows            } which are verbatim,
+  draft_head_fp8.py      fp8 copy of the draft LM head                  } which were changed
+  engram_prefetch.py     Engram row lookups on a side stream            }
+  autotune_keep.py       keep FlashInfer autotune caches across boots   }
+  draft_tau.py, folded_result_fence.py   present, off                   }
 runtime/flash_mla_sm120.py  SM12x sparse-MLA dispatch (64-token page split for FlashInfer)
 scripts/pack_engram.py   repack one rank's Engram rows (weight+scale adjacent) to local disk
 scripts/profile/         torch-profiler helper and trace analysers (see Profiling)
 files/                   NFS export helpers
-benchmarks/, tests/      upstream benchmark and row-store tests
+benchmarks/, tests/      upstream benchmark, row-store, thinking-alias, encoder-parity, max-tokens and loop-abort tests
 ```
 
 ## Knobs (`.env`)
 
 | Variable | Default | Notes |
 |---|---|---|
-| `TP_SIZE` / `EP_SIZE` / `NNODES` | 3 / 3 / 3 | world size = 3 GPUs |
+| `TP_SIZE` / `EP_SIZE` / `NNODES` | 3 / 1 / 3 | world size = 3 GPUs. EP 1 tensor-shards every expert (768-wide intermediate per rank) instead of whole experts per rank: NCCL 12.9 → 5.6 ms/step, C1 +8-12 % over EP 3 (2026-09-24) |
 | `CONTEXT_LENGTH` | 262144 | per-request limit; model max 1,048,576. The head's memory bounds what works: 32k prompts (4 concurrent) are verified, 64k+ exhausts the head (REPORT.md §17); use 32768 for unattended endpoints |
 | `MAX_TOTAL_TOKENS` | 750000 | KV pool, pinned. 1,670.75 B/token/rank; see *Memory* |
 | `MAX_RUNNING_REQUESTS` | 4 | also the CUDA-graph batch tiers (1-4) |
 | `MEM_FRACTION_STATIC` | 0.95 | ≥0.944 needed; lowering it does not free RAM, it only starves KV |
-| `SPEC_ALGO` / `DSPARK_BLOCK_SIZE` | DSPARK / 5 | 6-token verify window; `off` disables speculation |
+| `SPEC_ALGO` / `DSPARK_BLOCK_SIZE` | DSPARK / 5 | 6-token verify window (1+k), used with `DSV41_VERIFY_CAP=conf:0.1`. Without the cap k=5 over-drafts on prose (-8 to -16 %); with it code gains +10 % over k=3 and prose is unchanged. `off` disables speculation |
+| `DSV41_WO_A_W8` / `_MID` / `_DROP` | 1 / 1 / 1 | fp8 twin of the target's `wo_a` (the bf16 einsum was ~11 ms/step). W8 alone does not fit at 0.95 (+688 MiB); DROP releases the bf16 copies (net -640 MB/rank), MID serves 9-192-row verifies (C4). `DSV41_WO_A_W8_DRAFT` (0) also routes the draft's own einsum; measured neutral |
+| `DSV41_VERIFY_CAP` / `DSV41_BLOCK_VERIFY` | conf:0.1 / 1 | cap each step's verified drafts by the draft's confidence; block verification keeps sampled rows exact under the cap |
+| `DSV41_DRAFT_HEAD_FP8` | 1 | fp8 copy of the draft LM head, ~-1 ms/step, +210 MiB |
+| `DSV41_ENGRAM_PREFETCH` | 1 | Engram row lookups on a side stream, -2.3 to -2.9 ms/step; needs packed shards. `DSV41_ENGRAM_PREFETCH_CHECK=1` compares against the synchronous path (validation only) |
+| `DSV41_AUTOTUNE_KEEP` | 1 | keep FlashInfer autotune caches across boots of one launch: same tactics, reproducible greedy output and tok/s |
+| `DSV41_DRAFT_TAU` / `DSV41_FOLDED_FENCE` | 1 / 0 | off: draft temperature 0.8 measured +1.2 % on sampled chat, inside noise |
 | `DSPARK_SPS_TABLE` | /state/dspark_sps.json | profiled cost table; enables compact ragged verify when present |
 | `EXTRA_SGLANG_ARGS` | `--fp8-gemm-backend flashinfer_cutlass --watchdog-timeout 1800` | required for the MXFP8 route (below) |
 | `DSV41_MXFP8_BACKEND` | b12x | FlashInfer kernel for the FP8 dense projections: `b12x`, `cudnn`, `cutlass` |
 | `SGLANG_FLASHINFER_MOE_FUSED_FINALIZE` | 0 | keep 0: the fused (atomic) finalize is nondeterministic |
+| `SGLANG_DSV41_REASONING_EFFORT` | 75 | default budget for thinking-mode requests without a `reasoning_effort`. SGLang's V4.1 encoder maps `low`/`high`/`xhigh`/`max` to 25/50/75/100 and defaults to `high` = 50; the publisher's `encoding.py` says 50/75/100, default 75. The adapter remaps the tiers; this pins the default. Integer 1-100; see *Correctness notes* |
+| `DSV41_MAX_NEW_TOKENS` | 32768 | fill-in and hard cap when a chat request omits `max_tokens` / `max_completion_tokens`, or asks for more. 0 leaves SGLang's remaining-context default (how VIS-04 ran to 714k tokens). |
+| `DSV41_LOOP_ABORT` | 1 | stop a request whose output is an n-gram cycle, a same-token run, or the same decoded line repeated. `finish_reason=stop` / `matched=repetition`. 0 disables. The 2× EXL3 recipe has no equivalent; `--watchdog-timeout` does not fire on a live stream. |
+| `DSV41_LOOP_NGRAM` / `DSV41_LOOP_REPEATS` | 32 / 4 | minimum cycle length in tokens, and consecutive copies required (keeps one copy). |
+| `DSV41_LOOP_LINE_REPEATS` | 8 | identical decoded lines of at least 16 characters. 0 disables the line detector. |
 | `NCCL_BUFFSIZE` / `NCCL_LL128_BUFFSIZE` / `NCCL_PROTO` / `NCCL_MAX_NCHANNELS` | 1 MiB / 256 KiB / `^LL128` / 8 | NCCL connection buffers: 4.7 GiB → 0.14 GiB pinned per node |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:False` | never `True`: with expandable segments every prefill of more than 64 query tokens returns NaN logits (garbage for prompts of 65-~4000 tokens and for 3+ concurrent requests; REPORT.md §17). The native allocator fragments on long prompts, hence the context cap |
 | `DSV41_PREFILL_EMPTY_CACHE_TOKENS` | 8192 | `adapter/prefill_empty_cache.py`: after each prefill chunk of a sequence this long or longer, give the allocator's cached blocks back so a long prompt costs one chunk's transient, not the sum (REPORT.md §17). 0 disables |
@@ -254,6 +350,33 @@ Where the 118 → 82 ms came from, in order of size:
   length tested; cost ~0.3 ms per step. Batches at concurrency >1 can still differ between
   runs because batch composition changes which GEMM tiles run; that is normal SGLang
   behaviour without `--enable-deterministic-inference`.
+- **Reasoning budget.** DeepSeek-V4.1 takes a numeric reasoning effort (1-100) as a prompt
+  prefix in thinking mode. SGLang's built-in V4.1 encoder maps the named tiers
+  `low`/`high`/`xhigh`/`max` to 25/50/75/100 and defaults to `high`, so every thinking request
+  ran at budget 50 and `low` meant 25; the publisher's `encoding/encoding.py` maps
+  `low`/`high`/`max` to 50/75/100 with default 75 (evaluations used 100). `adapter/encoding_compat.py`
+  remaps the tiers to the publisher's table (`xhigh` kept as an alias for 75) and
+  `SGLANG_DSV41_REASONING_EFFORT=75` pins the default. Per request: the OpenAI `reasoning_effort`
+  field (a tier, or a 0-0.99 float = budget/100) or `"chat_template_kwargs":{"reasoning_effort":N}`;
+  `medium` is not a V4.1 tier and falls back to the default with a warning. The budget changes
+  reasoning length and DSpark acceptance, so state it with any thinking-mode number; the decode
+  tables in this README are thinking-off. Same correction as local-inference-lab/rtx6kpro R37.
+- **Thinking toggle.** SGLang reads `chat_template_kwargs.thinking`. vLLM-style
+  `enable_thinking` is copied onto `thinking` before encode/parse, so either name works.
+  `python3 tests/test_thinking_alias.py` covers the alias; `python3 tests/test_chat_encoding.py`
+  diffs tool and thinking-off renders against the checkpoint's `encoding/encoding.py` (and
+  against SGLang's `encoding_dsv41` inside the image).
+- **Completion cap.** Chat requests that omit `max_tokens` fill the remaining context on
+  this OpenAI path. The 2× EXL3 recipe has no server-side cap either (vLLM does the same
+  fill) but every one of its smokes and README curls sends `max_tokens`. This recipe now
+  does both: examples send `max_tokens`, and `adapter/encoding_compat.py` fills/clamps at
+  `DSV41_MAX_NEW_TOKENS` (default 32768). Set it to 0 to replay an uncapped harness.
+- **Loop abort.** VIS-04 was a semantic loop, not a hung GPU: 714k tokens over ~2.6 h while
+  `--watchdog-timeout 1800` stayed quiet. `adapter/loop_abort.py` finishes the request after
+  four consecutive copies of a ≥32-token n-gram, 64 identical tokens, or eight identical
+  decoded lines, with OpenAI `finish_reason=stop` (`matched=repetition`). The 2× EXL3 recipe
+  has no decode-side detector. `python3 tests/test_loop_abort.py` covers the detector; set
+  `DSV41_LOOP_ABORT=0` to turn it off.
 - `runtime/flash_mla_sm120.py` sends prefills of more than 64 query tokens to FlashInfer's
   sparse-prefill specialisation and everything else through the decode kernel with a
   256→64-token page split; both paths were verified deterministic.
@@ -282,6 +405,9 @@ fails), and the head has little RAM to spare.
 - Measure decode as `usage.completion_tokens / elapsed` on non-streaming requests or from the
   `gen throughput` field of `Decode batch` log lines; counting SSE chunks under-reports ~3.5×
   because each chunk carries a whole accepted speculative block.
+- The TP4 decode and prefill tables above were produced with
+  [sparkDash](https://github.com/MiaAI-Lab/sparkDash), which drives the OpenAI endpoint at a
+  fixed stream count and reports aggregate and per-stream rates alongside TTFT.
 - `./start.sh build` rsyncs the repo to the workers with `--delete`; `engram/` and the state,
   logs and `.env` are excluded. Do not edit `start.sh` while a `./start.sh` command is running
   (bash reads scripts incrementally).
@@ -292,8 +418,8 @@ fails), and the head has little RAM to spare.
 
 ## Still on the table
 
-- `wo_a` runs as a bf16 einsum (cuBLAS `cutlass_80` kernels, ~11 ms per step); an MXFP8 path
-  needs a small change in `models/deepseek_v4.py`.
+- After the 2026-09-24 changes the bs=1 step is ~59 ms (docs/overnight-results.md): MoE ~21 ms,
+  b12x dense FP8 ~17 ms, NCCL ~5.6 ms, `wo_a` twin 3.5 ms, the draft's bf16 `wo_a` 2.4 ms.
 - The MoE cost scales with the 6-token verify window. A profiled SPS table
   (`python -m sglang.benchmark.dspark_sps_profiler all --base-url ...`, pushed to every rank
   by `start.sh`) turns on compact ragged verify, which mainly pays at concurrency ≥2.
@@ -308,6 +434,33 @@ fails), and the head has little RAM to spare.
   (MIT, notice retained in `LICENSE.upstream-MIT`). Everything Spark-specific (TP=3 padding,
   NFS sharing, packed shards, the b12x route, the padded-scale repair, the NCCL and finalize
   settings) was added here.
+- **Decode adapters from [knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4)**
+  (AGPL-3.0, the same licence; that repository builds on this one). Written by knapcio for
+  a 4-Spark TP4 fleet, taken at commit `4d8f4c0` on 2026-09-24. Thank you to knapcio for the kernels,
+  the measurements behind them, and the public write-ups that made them easy to evaluate.
+  - Used verbatim: `verify_cap.py`, `block_verify.py`, `draft_head_fp8.py`, `engram_prefetch.py`,
+    `draft_tau.py`, `folded_result_fence.py` and their tests. `draft_tau` and `folded_result_fence`
+    ship off here (not demonstrated on TP3).
+  - Adapted here: `wo_a_w8.py`: generalised from TP4's 2 local o_groups to TP3's 4 padded groups,
+    an einsum bridge for the older `dev-dsv41` engine (which lacks the kernel module the original
+    patches), a fix that keeps the DSpark draft's `wo_a` out of DROP (on this engine the draft
+    reads the weight directly and DROP turned every draft into garbage), and the optional
+    `DSV41_WO_A_W8_DRAFT` route. `autotune_keep.py`: a stale-cache fix (with no matching sidecar
+    on any rank the stock gate still loaded every rank's old file) and exclusion of the per-boot
+    `SGLANG_RUN_ID` from the launch fingerprint (with it, no cache was ever reused); test extended.
+  - Configuration ideas from knapcio's measurements: DSpark k=5 with the `conf:0.1` cap. Each was
+    re-measured on TP3 one switch per boot before it became a default.
+  - Not adopted: RoCEnante transport, the display-reservation (DRM) row cache, shared-expert
+    padding, fast load, the chunked-indexer prefill variants, the canary image, and the TP4
+    memory profile (16 slots, 8M KV, 0.80 fraction).
+- **Originally this repository's** (unchanged by the above): TP3 padding (`tp3_pad.py`), the b12x
+  MXFP8 route and padded-scale repair (`mxfp8_b12x.py`), the NVMe Engram row store and packed
+  shards (`engram_backend.py`, `row_store.cpp`, `scripts/pack_engram.py`, which the prefetch
+  adapter builds on), the prefill empty-cache hook, loop abort, the encoder/effort compatibility
+  layer, the NCCL buffer and fused-finalize settings, the NFS sharing and multi-node launcher, the
+  TP3 measurements, and the TP3/EP1 finding (EP 1 was this repository's own A/B, not a knapcio
+  setting). The 2026-09-24 campaign that selected and validated the combination is in
+  [`docs/overnight-results.md`](docs/overnight-results.md).
 - `runtime/flash_mla_sm120.py` is Apache-2.0 from SGLang (`LICENSE.sglang`).
 - Serving engine: [SGLang](https://github.com/sgl-project/sglang) dev build with
   [FlashInfer](https://github.com/flashinfer-ai/flashinfer) kernels.
