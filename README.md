@@ -221,7 +221,7 @@ finds nothing to repair at TP4.
 start.sh                 doctor / build / share / pack / serve / stop / status / logs / smoke
 start-tp4.sh             same commands for 4 Sparks (profile: .env.tp4, state-tp4/, logs-tp4/)
 boot.py                  in-container entrypoint: download+verify (optional), launch, smoke
-Dockerfile               lmsysorg/sglang:dev-dsv41 (arm64) + adapter/ + runtime/ overlay
+Dockerfile               lmsysorg/sglang:dev-dsv41 pinned by digest (sha256:3dbc3130…, arm64) + adapter/ + runtime/ overlay
 adapter/
   sitecustomize.py       import hooks that install the pieces below at process start
   encoding_compat.py     enable_thinking alias, publisher effort table, max_tokens cap
