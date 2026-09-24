@@ -94,7 +94,7 @@ HF_REPO="${HF_REPO:-deepseek-ai/DeepSeek-V4.1-Flash}"
 HF_REVISION="${HF_REVISION:-fb2764a5cf321eaa5070ca8f9e892818f477c16d}"
 EXPECTED_SHARDS="${EXPECTED_SHARDS:-48}"
 
-BASE_IMAGE="${BASE_IMAGE:-lmsysorg/sglang:dev-dsv41}"
+BASE_IMAGE="${BASE_IMAGE:-lmsysorg/sglang:dev-dsv41@sha256:3dbc313030a6ef2c5d7de8ecf48e9aece722694a82182cb618cc82b588816349}"   # same pin as the Dockerfile FROM
 IMAGE="${IMAGE:-dsv41-3x-spark:local}"
 HEAD_CTN="${HEAD_CTN:-dsv41-head}"
 WORKER_CTN="${WORKER_CTN:-dsv41-worker}"
@@ -135,6 +135,32 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-320000}"
 SPEC_ALGO="${SPEC_ALGO:-DSPARK}"
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-3}"
+# The TP4 decode adapters are loaded in the image but off. Turning them on
+# made spark3 drop its weights at FlashInfer autotune: that pass is a
+# target-verify forward, rank 2 is the padded shard, and wo_a DROP has already
+# replaced those parameters with a 1-element stand-in while Engram prefetch
+# and the verify remap run inside the profiled forward.
+if [[ "$TP_SIZE" == "3" ]]; then
+  DSV41_WO_A_W8="${DSV41_WO_A_W8:-0}"
+  DSV41_WO_A_W8_MID="${DSV41_WO_A_W8_MID:-0}"
+  DSV41_WO_A_W8_DROP="${DSV41_WO_A_W8_DROP:-0}"
+  DSV41_DRAFT_HEAD_FP8="${DSV41_DRAFT_HEAD_FP8:-0}"
+  DSV41_VERIFY_CAP="${DSV41_VERIFY_CAP:-0}"
+  DSV41_DRAFT_TAU="${DSV41_DRAFT_TAU:-1}"
+  DSV41_BLOCK_VERIFY="${DSV41_BLOCK_VERIFY:-0}"
+  DSV41_ENGRAM_PREFETCH="${DSV41_ENGRAM_PREFETCH:-0}"
+  DSV41_FOLDED_FENCE="${DSV41_FOLDED_FENCE:-0}"
+else
+  DSV41_WO_A_W8="${DSV41_WO_A_W8:-0}"
+  DSV41_WO_A_W8_MID="${DSV41_WO_A_W8_MID:-0}"
+  DSV41_WO_A_W8_DROP="${DSV41_WO_A_W8_DROP:-0}"
+  DSV41_DRAFT_HEAD_FP8="${DSV41_DRAFT_HEAD_FP8:-0}"
+  DSV41_VERIFY_CAP="${DSV41_VERIFY_CAP:-0}"
+  DSV41_DRAFT_TAU="${DSV41_DRAFT_TAU:-1}"
+  DSV41_BLOCK_VERIFY="${DSV41_BLOCK_VERIFY:-0}"
+  DSV41_ENGRAM_PREFETCH="${DSV41_ENGRAM_PREFETCH:-0}"
+  DSV41_FOLDED_FENCE="${DSV41_FOLDED_FENCE:-0}"
+fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v4.1-flash}"
 SKIP_PREPARE="${SKIP_PREPARE:-1}"
 SKIP_VERIFY="${SKIP_VERIFY:-1}"
@@ -288,6 +314,18 @@ docker_common_args() {
     -e "CUDA_GRAPH_MAX_BS_DECODE=$MAX_RUNNING_REQUESTS"
     -e "SPEC_ALGO=$SPEC_ALGO"
     -e "DSPARK_BLOCK_SIZE=$DSPARK_BLOCK_SIZE"
+    -e "DSV41_WO_A_W8=$DSV41_WO_A_W8"
+    -e "DSV41_WO_A_W8_MID=$DSV41_WO_A_W8_MID"
+    -e "DSV41_WO_A_W8_DROP=$DSV41_WO_A_W8_DROP"
+    -e "DSV41_DRAFT_HEAD_FP8=$DSV41_DRAFT_HEAD_FP8"
+    -e "DSV41_VERIFY_CAP=$DSV41_VERIFY_CAP"
+    -e "DSV41_DRAFT_TAU=$DSV41_DRAFT_TAU"
+    -e "DSV41_BLOCK_VERIFY=$DSV41_BLOCK_VERIFY"
+    -e "DSV41_ENGRAM_PREFETCH=$DSV41_ENGRAM_PREFETCH"
+    -e "DSV41_FOLDED_FENCE=$DSV41_FOLDED_FENCE"
+    -e "DSV41_AUTOTUNE_KEEP=${DSV41_AUTOTUNE_KEEP:-0}"
+    -e "DSV41_WO_A_W8_DRAFT=${DSV41_WO_A_W8_DRAFT:-0}"
+    -e "DSV41_ENGRAM_PREFETCH_CHECK=${DSV41_ENGRAM_PREFETCH_CHECK:-0}"
     -e "SERVED_MODEL_NAME=$SERVED_MODEL_NAME"
     -e "SKIP_PREPARE=$SKIP_PREPARE"
     -e "SKIP_VERIFY=$SKIP_VERIFY"
@@ -331,6 +369,10 @@ docker_common_args() {
   fi
   if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
     _a+=(-e "EXTRA_SGLANG_ARGS=$EXTRA_SGLANG_ARGS")
+  fi
+  # Unset means the engine's AUTO (decided from min free memory across ranks); only forward an explicit mode.
+  if [[ -n "${SGLANG_DSPARK_FOLDED_SAMPLING:-}" ]]; then
+    _a+=(-e "SGLANG_DSPARK_FOLDED_SAMPLING=$SGLANG_DSPARK_FOLDED_SAMPLING")
   fi
   switchless_ring_args _a
   nccl_mount_args _a || die "NCCL mount setup failed"
@@ -393,6 +435,18 @@ worker_env_lines() {
     -e "CUDA_GRAPH_MAX_BS_DECODE=$MAX_RUNNING_REQUESTS"
     -e "SPEC_ALGO=$SPEC_ALGO"
     -e "DSPARK_BLOCK_SIZE=$DSPARK_BLOCK_SIZE"
+    -e "DSV41_WO_A_W8=$DSV41_WO_A_W8"
+    -e "DSV41_WO_A_W8_MID=$DSV41_WO_A_W8_MID"
+    -e "DSV41_WO_A_W8_DROP=$DSV41_WO_A_W8_DROP"
+    -e "DSV41_DRAFT_HEAD_FP8=$DSV41_DRAFT_HEAD_FP8"
+    -e "DSV41_VERIFY_CAP=$DSV41_VERIFY_CAP"
+    -e "DSV41_DRAFT_TAU=$DSV41_DRAFT_TAU"
+    -e "DSV41_BLOCK_VERIFY=$DSV41_BLOCK_VERIFY"
+    -e "DSV41_ENGRAM_PREFETCH=$DSV41_ENGRAM_PREFETCH"
+    -e "DSV41_FOLDED_FENCE=$DSV41_FOLDED_FENCE"
+    -e "DSV41_AUTOTUNE_KEEP=${DSV41_AUTOTUNE_KEEP:-0}"
+    -e "DSV41_WO_A_W8_DRAFT=${DSV41_WO_A_W8_DRAFT:-0}"
+    -e "DSV41_ENGRAM_PREFETCH_CHECK=${DSV41_ENGRAM_PREFETCH_CHECK:-0}"
     -e "SERVED_MODEL_NAME=$SERVED_MODEL_NAME"
     -e "SKIP_PREPARE=1"
     -e "SKIP_VERIFY=1"
@@ -430,6 +484,9 @@ worker_env_lines() {
     -e "HOST_IP=$wip"
     -e "VLLM_HOST_IP=$wip"
   )
+  if [[ -n "${SGLANG_DSPARK_FOLDED_SAMPLING:-}" ]]; then
+    worker_args+=(-e "SGLANG_DSPARK_FOLDED_SAMPLING=$SGLANG_DSPARK_FOLDED_SAMPLING")
+  fi
   switchless_ring_args worker_args
   printf '        %q ' "${worker_args[@]}"
   printf '\\\n'
@@ -475,6 +532,7 @@ cmd_doctor() {
   echo "model:    $MODEL_DIR"
   echo "parallel: nnodes=$NNODES TP=$TP_SIZE EP=$EP_SIZE  ctx=$CONTEXT_LENGTH  util=$MEM_FRACTION_STATIC (head $HEAD_MEM_FRACTION_STATIC)"
   echo "offload:  $OFFLOAD_MODE  cache=${DSV41_CACHE_GIB}GiB  spec=$SPEC_ALGO-$DSPARK_BLOCK_SIZE  port=$PORT"
+  echo "decode:   wo_a_w8=$DSV41_WO_A_W8 mid=$DSV41_WO_A_W8_MID drop=$DSV41_WO_A_W8_DROP  draft_head_fp8=$DSV41_DRAFT_HEAD_FP8  verify_cap=$DSV41_VERIFY_CAP  draft_tau=$DSV41_DRAFT_TAU  block_verify=$DSV41_BLOCK_VERIFY  engram_prefetch=$DSV41_ENGRAM_PREFETCH  folded_fence=$DSV41_FOLDED_FENCE"
   echo
   local ok=0
   command -v docker >/dev/null || { warn "docker missing on head"; ok=1; }
