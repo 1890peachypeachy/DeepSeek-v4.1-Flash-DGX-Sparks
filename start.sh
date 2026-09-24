@@ -351,6 +351,9 @@ docker_common_args() {
     -e "DSV41_MXFP8_BACKEND=${DSV41_MXFP8_BACKEND:-b12x}"
     -e "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=${SGLANG_FLASHINFER_MOE_FUSED_FINALIZE:-1}"
     -e "SGLANG_DSV41_REASONING_EFFORT=${SGLANG_DSV41_REASONING_EFFORT:-75}"
+    # GB10 fleet: spark nodes run a desktop session; the strict 90% TP balance gate raises
+    # on benign holders. Log-only by default (upstream warning path); set =1 to re-arm.
+    -e "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=${SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK:-0}"
     -e "DSV41_MAX_NEW_TOKENS=${DSV41_MAX_NEW_TOKENS:-32768}"
     -e "DSV41_LOOP_ABORT=${DSV41_LOOP_ABORT:-1}"
     -e "DSV41_LOOP_NGRAM=${DSV41_LOOP_NGRAM:-32}"
@@ -471,6 +474,9 @@ worker_env_lines() {
     -e "DSV41_MXFP8_BACKEND=${DSV41_MXFP8_BACKEND:-b12x}"
     -e "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=${SGLANG_FLASHINFER_MOE_FUSED_FINALIZE:-1}"
     -e "SGLANG_DSV41_REASONING_EFFORT=${SGLANG_DSV41_REASONING_EFFORT:-75}"
+    # GB10 fleet: spark nodes run a desktop session; the strict 90% TP balance gate raises
+    # on benign holders. Log-only by default (upstream warning path); set =1 to re-arm.
+    -e "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=${SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK:-0}"
     -e "DSV41_MAX_NEW_TOKENS=${DSV41_MAX_NEW_TOKENS:-32768}"
     -e "DSV41_LOOP_ABORT=${DSV41_LOOP_ABORT:-1}"
     -e "DSV41_LOOP_NGRAM=${DSV41_LOOP_NGRAM:-32}"
