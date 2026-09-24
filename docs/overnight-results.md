@@ -133,7 +133,8 @@ DSV41_AUTOTUNE_KEEP=1
 ```
 
 Images: `dsv41-3x-spark:local` rebuilt from this working tree on all three nodes on the common base
-`lmsysorg/sglang:dev-dsv41` = sha256:37939c26c0ba… (2026-09-10 build, SGLang 0.0.0.dev0,
+`lmsysorg/sglang:dev-dsv41@sha256:3dbc3130…` (public on Docker Hub; arm64 image id 37939c26c0ba…,
+2026-09-10, SGLang 0.0.0.dev0,
 FlashInfer 0.6.18). Packed Engram: head `~/dsv41-engram/engram-l{1,14}-r0of3.bin`, workers
 `/home/zurih/dsv41-3x-spark/engram/engram-l{1,14}-r{1,2}of3.bin` (31.5 GiB each).
 Engine-side facts on the final boots: folded DSpark sampling active (AUTO), verify cap captured for

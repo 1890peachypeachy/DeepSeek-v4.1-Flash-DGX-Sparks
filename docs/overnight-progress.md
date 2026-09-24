@@ -17,7 +17,8 @@ every 2 s, 0.06 % CPU). Pausing it was not permitted by the session's safety pol
 - Running: TP3/EP3, DSpark k=3, 4 slots, chunk 1024, KV pin 750k (effective pool 491,520), fraction
   0.95, b12x MXFP8, cache 0 GiB, adapters off, **packed=False** on all ranks (engram dirs empty).
 - **Mixed SGLang builds across ranks.** head and spark2 run base `lmsysorg/sglang:dev-dsv41` =
-  `37939c26` (2026-09-10 local build, version 0.0.0.dev0); spark3's tag of the same name points at
+  `37939c26` (2026-09-10; public on Docker Hub as `lmsysorg/sglang@sha256:3dbc3130…`, whose amd64 member is
+  the 0xSero pin; its internal labels say `local/sglang:dev`, version 0.0.0.dev0); spark3's tag of the same name points at
   `381b27ff` (2026-09-11, `da64c5cbb`). 40 SGLang source files differ, among them
   `models/deepseek_v4.py`, `deepseek_v4_dspark.py`, `dspark_worker_v2.py`, MoE layer/topk, fp8
   quantization and the memory pool; spark3 also has 9 extra modules (e.g. `wo_a_bf16_small_batch.py`,
