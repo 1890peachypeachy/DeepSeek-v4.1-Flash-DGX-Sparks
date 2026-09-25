@@ -17,9 +17,9 @@ endpoint.
 |---|---|
 | Decode, prose, 1 stream | 51.0 tok/s, TTFT 223 ms (~59 ms per speculative step) |
 | Decode, prose, 2 / 4 streams | 75.1 / 85.4 tok/s aggregate (39.0 / 22.8 per stream), TTFT 290 / 356 ms |
-| Decode, 4 Sparks (TP=4), 1 / 2 / 4 / 8 / 16 streams | 45.4 / 72.9 / 103.1 / 114.1 / 134.2 tok/s aggregate (45.4 / 37.9 / 26.7 / 23.2 / 22.0 per stream), TTFT 212 / 232 / 270 ms, 2.70 / 12.45 s |
+| Decode, 4 Sparks (TP=4), prose, 1 / 2 / 4 / 8 / 16 streams | 87.7 / 120.4 / 163.6 / 237.6 / 342.7 tok/s aggregate (87.7 / 61.9 / 41.4 / 30.8 / 22.2 per stream). Code, structured and json are in [Four Sparks](#four-sparks-tp4) |
 | Prefill, 4 Sparks, 4K / 16K / 32K / 64K / 128K | 3,350 / 3,782 / 3,768 / 3,531 / 3,251 tok/s (TTFT 1.23 / 4.34 / 8.70 / 18.57 / 40.32 s) |
-| Context, 4 Sparks (TP=4) | 1M configured (model maximum) and verified: a 1M-context needle test passed with the shipped profile (1024-token chunks, 8M KV pin, 0.80 memory fraction) |
+| Context, 4 Sparks (TP=4) | 1M configured (model maximum) and verified: a 1,011,084-token needle passed on the production line (4096-token chunks with the chunked indexer, 8M KV pin, 0.80 memory fraction) |
 | Context | 256k limit configured (model max 1M). Verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts. With the 2026-09-24 decode stack a ~200k prompt at 1024 exhausted the head, so chunks are now 768 (191k verified before that change); KV pool 750k tokens |
 | Memory left on the head while serving | ~6 GB (was <1 GB) |
 | Greedy decoding | deterministic run to run |
@@ -155,8 +155,8 @@ cp -n .env.tp4.example .env.tp4      # IPs, ssh user, NFS addresses
 ./start-tp4.sh serve                 # ./start-tp4.sh stop|status|logs worker3
 ```
 
-What changes against the 3-node profile (measured on the earlier TP4 profile: EP 4, 8 slots,
-chunk 1024; the production line's numbers are in [docs/tp4.md](docs/tp4.md)):
+What changes against the 3-node profile. The TP4 column is the production line
+([docs/tp4.md](docs/tp4.md)):
 
 | | 3 Sparks (TP3) | 4 Sparks (TP4) |
 |---|---|---|
@@ -164,36 +164,31 @@ chunk 1024; the production line's numbers are in [docs/tp4.md](docs/tp4.md)):
 | free memory per rank while serving | ~6 GB | ~40 GB |
 | attention shards | heads padded 64→96, groups 8→12; rank 2 is all padding | exact: 16 heads, 2 groups per rank, no wasted GEMMs |
 | KV pool / context | 750k tokens / 256k limit, ~32k usable (memory-bound on the head) | 8M tokens (pinned) / 1M (model maximum; needle test passed at 1M) |
-| concurrency | 4 | 8 by default (measured to 16) |
+| concurrency | 4 | 16 |
 | NCCL per step | 104 collectives across 3 nodes | 104 collectives across 4 nodes (one more ring hop each) |
-| decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms | 45.4 tok/s, TTFT 212 ms |
-| decode, prose, 4 streams | 78.6 tok/s agg (20.9 per stream), TTFT 383 ms | 103.1 tok/s agg (26.7 per stream), TTFT 270 ms |
+| decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms | 87.7 tok/s |
+| decode, prose, 4 streams | 78.6 tok/s agg (20.9 per stream), TTFT 383 ms | 163.6 tok/s agg (41.4 per stream) |
 
-Measured on 4× DGX Spark with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (prose
-decode, 256 completion tokens; prefill at 4K–128K). Decode is faster than the 3-node fleet at every concurrency — smaller
+Measured on 4× DGX Spark with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (greedy,
+256 completion tokens). Decode is faster than the 3-node fleet at every concurrency — smaller
 attention GEMMs per rank and no padded shards more than pay for the extra NCCL hop.
 An independent switchless-ring reproduction (public OpenAI path, idle cluster,
 greedy code, estimated decode window 129–641) is in
 [`docs/tp4-switchless-ring-results.md`](docs/tp4-switchless-ring-results.md): C1 window
-67.4 tok/s estimated, C8 aggregate 224.8 tok/s (historical DSpark k=5; current
-default remains k=3).
-The memory headroom is what makes the 1M context possible. Decode has been measured out to
-16 streams (with `MAX_RUNNING_REQUESTS=16`): aggregate throughput is still climbing there
-(134.2 tok/s) but per-stream rate has flattened at ~22 tok/s and TTFT degrades sharply past
-4 streams — 2.70 s at 8, 12.45 s at 16 — as prefills queue behind each other on that profile.
-The current profile runs 16 slots; the production line's c16 row is in [docs/tp4.md](docs/tp4.md).
+67.4 tok/s estimated, C8 aggregate 224.8 tok/s. The production profile uses DSpark k=5.
+The memory headroom is what makes the 1M context possible. Prose aggregate is still
+climbing at 16 streams (342.7 tok/s) while each stream falls from 87.7 to 22.2 tok/s.
 
-**Decode** (prose, 256 tok):
+**Decode** (greedy, 256 tok; aggregate tok/s, per stream in brackets):
 
-| load | TTFT | aggregate | per stream |
-|---|---:|---:|---:|
-| ×1 | 212 ms | 45.4 tok/s | 45.4 tok/s |
-| ×2 | 232 ms | 72.9 tok/s | 37.9 tok/s |
-| ×4 | 270 ms | 103.1 tok/s | 26.7 tok/s |
-| ×8 | 2.70 s | 114.1 tok/s | 23.2 tok/s |
-| ×16 | 12.45 s | 134.2 tok/s | 22.0 tok/s |
+| prompt type | c1 | c2 | c4 | c8 | c16 |
+|---|---:|---:|---:|---:|---:|
+| prose | 87.7 | 120.4 (61.9) | 163.6 (41.4) | 237.6 (30.8) | 342.7 (22.2) |
+| code | 124.8 | 175.0 (88.4) | 246.8 (63.2) | 309.8 (41.4) | 438.3 (29.3) |
+| structured | 152.4 | 177.6 (103.3) | 240.4 (70.4) | 295.5 (44.2) | 572.2 (44.4) |
+| json | 118.9 | 174.2 (89.8) | 301.7 (76.2) | 471.5 (60.2) | 659.9 (42.7) |
 
-**Prefill:**
+**Prefill** on the earlier TP4 profile (EP 4, 1024-token chunks). Production-line prefill is in [docs/tp4.md](docs/tp4.md):
 
 | context | prompt tokens | TTFT | prefill |
 |---|---:|---:|---:|
