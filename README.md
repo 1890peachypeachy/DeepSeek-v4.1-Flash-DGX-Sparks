@@ -18,6 +18,7 @@ endpoint.
 | Decode, prose, 1 stream | 51.0 tok/s, TTFT 223 ms (~59 ms per speculative step) |
 | Decode, prose, 2 / 4 streams | 75.1 / 85.4 tok/s aggregate (39.0 / 22.8 per stream), TTFT 290 / 356 ms |
 | Decode, 4 Sparks (TP=4), prose, 1 / 2 / 4 / 8 / 16 streams | 87.7 / 120.4 / 163.6 / 237.6 / 342.7 tok/s aggregate (87.7 / 61.9 / 41.4 / 30.8 / 22.2 per stream). Code, structured and json are in [Four Sparks](#four-sparks-tp4) |
+| Prefill, 3 Sparks (TP=3) | ~2,000 tok/s |
 | Prefill, 4 Sparks (TP=4), cold, 4k / 16k / 32k / 64k / 128k / 262k | 4,059 / 5,855 / 5,900 / 5,925 / 5,797 / 5,394 tok/s (sparkDash 1.8.8, synthetic filler). Real text at 16k–128k is 4.9k–5.0k tok/s |
 | Context, 4 Sparks (TP=4) | 1M configured (model maximum) and verified: a 1,011,084-token needle passed on the production line (4096-token chunks with the chunked indexer, 8M KV pin, 0.80 memory fraction) |
 | Context | 256k limit configured (model max 1M). Verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts. With the 2026-09-24 decode stack a ~200k prompt at 1024 exhausted the head, so chunks are now 768 (191k verified before that change); KV pool 750k tokens |
@@ -170,6 +171,7 @@ What changes against the 3-node profile. The TP4 column is the production line
 | NCCL per step | 104 collectives across 3 nodes | 104 collectives across 4 nodes (one more ring hop each) |
 | decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms | 87.7 tok/s |
 | decode, prose, 4 streams | 78.6 tok/s agg (20.9 per stream), TTFT 383 ms | 163.6 tok/s agg (41.4 per stream) |
+| prefill | ~2,000 tok/s | 4,059–5,925 tok/s (cold, 4k–128k; real text 4.9k–5.0k at 16k–128k) |
 
 Measured on 4× DGX Spark with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (greedy,
 256 completion tokens). Decode is faster than the 3-node fleet at every concurrency — smaller
