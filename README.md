@@ -96,6 +96,8 @@ switched fabric): prose c1 87.7 tok/s, code c1 124.8, prose c16 342.7 aggregate,
 4,059 / 5,855 / 5,900 / 5,925 / 5,797 / 5,394 tok/s at 4k–262k, real text 4.9k–5.0k tok/s at 16k–128k, qeval 72/75, a 1,011,084-token needle passes. The profile,
 images, results, rollback and credits are on that page.
 
+The improvements for now are only for TP=4 and do not affect TP=3. Thanks to [@majewskizby](https://github.com/knapcio) for the awesome [PR](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/36), who brought the opt-in four-Spark production line: the RoCEnante image, EP 1 with the routed MoE on b12x, prefill sequence parallel, the fast loader and the gated decode adapters, and measured it from a fresh clone. `./start.sh` is unchanged.
+
 `start-tp4.sh` is the same engine and image with a profile of its own: `.env.tp4`
 (copied from `.env.tp4.example` on first run), `state-tp4/` and `logs-tp4/`, so one
 checkout can drive a 3-node and a 4-node fleet. Everything TP4-specific lives in
