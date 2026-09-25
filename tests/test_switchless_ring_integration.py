@@ -339,11 +339,14 @@ NFS_REUSE_EXPORT=1; nfs_publish_model; printf 'DEVICE=%s\\n' "$NFS_DEVICE"
 def test_tp4_profile_ring_flags_are_commented_and_base_defaults_preserved():
     text = (ROOT / ".env.tp4.example").read_text()
     values = dict(re.findall(r"(?m)^([A-Z][A-Z0-9_]*)=(.*)$", text))
-    assert values["DSV41_SERIAL_WEIGHT_LOAD"] == "1"
-    for key in ("NCCL_SWITCHLESS_RING_ONLY", "NCCL_ALGO", "NCCL_MIN_NCHANNELS", "NCCL_P2P_LEVEL"):
+    # The TP4 profile is the switched production line: the ring's serial loader ships
+    # commented in the ring block, next to the ring flags.
+    commented = set(re.findall(r"(?m)^#([A-Z][A-Z0-9_]*)=", text))
+    for key in ("NCCL_SWITCHLESS_RING_ONLY", "NCCL_ALGO", "NCCL_MIN_NCHANNELS", "NCCL_P2P_LEVEL", "DSV41_SERIAL_WEIGHT_LOAD"):
         assert key not in values
+        assert key in commented
     assert values["NCCL_MAX_NCHANNELS"] == "8"
-    for key, value in {"DSPARK_BLOCK_SIZE": "3", "SGLANG_DSV41_REASONING_EFFORT": "75", "DSV41_MAX_NEW_TOKENS": "32768", "DSV41_LOOP_ABORT": "1"}.items():
+    for key, value in {"DSPARK_BLOCK_SIZE": "5", "SGLANG_DSV41_REASONING_EFFORT": "75", "DSV41_MAX_NEW_TOKENS": "32768", "DSV41_LOOP_ABORT": "1"}.items():
         assert values[key] == value
 
 
