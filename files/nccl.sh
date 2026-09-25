@@ -53,11 +53,13 @@ nccl_validate_config() {
     return 1
   fi
   [[ "${NCCL_SWITCHLESS_RING_ONLY:-0}" == 1 ]] || return 0
-  if [[ "$NNODES" != 4 || "$TP_SIZE" != 4 || "$EP_SIZE" != 4 ||
+  # The ring spans the tensor-parallel group, so NNODES = TP_SIZE = 4. EP_SIZE only groups
+  # the MoE experts inside it: 4, 2 and 1 all run on a ring (the TP4 production line is EP 1).
+  if [[ "$NNODES" != 4 || "$TP_SIZE" != 4 || ! "$EP_SIZE" =~ ^[124]$ ||
         "$NCCL_OVERLAY_PIP" != 1 || "${NCCL_ALGO:-Ring}" != Ring ||
         "$NCCL_NET" != IB || "$NCCL_IB_DISABLE" != 0 ||
         "${NCCL_IB_SUBNET_AWARE_ROUTING:-1}" != 1 ]]; then
-    echo 'Ring requires NNODES=TP_SIZE=EP_SIZE=4, NCCL_OVERLAY_PIP=1, NCCL_ALGO=Ring, NCCL_NET=IB, NCCL_IB_DISABLE=0 and subnet-aware routing=1' >&2
+    echo 'Ring requires NNODES=TP_SIZE=4, EP_SIZE 1, 2 or 4, NCCL_OVERLAY_PIP=1, NCCL_ALGO=Ring, NCCL_NET=IB, NCCL_IB_DISABLE=0 and subnet-aware routing=1' >&2
     return 1
   fi
   local minimum="${NCCL_MIN_NCHANNELS:-4}" maximum="${NCCL_MAX_NCHANNELS:-32}"

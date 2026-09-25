@@ -187,6 +187,10 @@ def test_ring_config_requires_safe_overlay_and_ring_algorithm():
         check(shell("nccl_validate_config", d, settings))
         for key, value in (("NCCL_OVERLAY_PIP", "0"), ("NCCL_ALGO", "Tree"), ("NCCL_MIN_NCHANNELS", "33"), ("NCCL_IB_DISABLE", "1"), ("DSV41_SERIAL_WEIGHT_LOAD", "yes")):
             assert shell("nccl_validate_config", d, {**settings, key: value}).returncode != 0
+        for ep in ("1", "2"):   # EP groups the experts inside the TP ring
+            check(shell("nccl_validate_config", d, {**settings, "EP_SIZE": ep}))
+        for ep in ("3", "8", "0"):
+            assert shell("nccl_validate_config", d, {**settings, "EP_SIZE": ep}).returncode != 0
 
 
 def test_preflight_rejects_stock_nccl_and_missing_pip_path():

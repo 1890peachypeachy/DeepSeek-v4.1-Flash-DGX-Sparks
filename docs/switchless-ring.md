@@ -10,11 +10,18 @@ measurements. The underlying NCCL transport patch is credited to
 external prerequisite and this repository does not build or distribute it.
 
 The ring transport is opt-in with `NCCL_SWITCHLESS_RING_ONLY=1`. Switched TP3/TP4
-transport defaults remain unchanged. `.env.tp4.example` enables
-`DSV41_SERIAL_WEIGHT_LOAD=1` as a GB10 memory safeguard, independently of topology.
-Current `main` retains DSpark **k=3**, the thinking alias and reasoning budget 75,
-the 32,768-token output cap, and loop abort. The historical ring benchmarks used
-**k=5**; they do not establish k=3 performance.
+transport defaults remain unchanged. The ring block of `.env.tp4.example` carries
+`DSV41_SERIAL_WEIGHT_LOAD=1` (commented, with the ring flags) as the GB10 memory
+safeguard the tested ring used. The TP4 profile runs DSpark **k=5** (the value of the
+historical ring benchmarks); `start.sh` keeps **k=3** as its default, with the thinking
+alias and reasoning budget 75, the 32,768-token output cap, and loop abort.
+
+The second half of this guide covers what the TP4 production line
+([docs/tp4.md](tp4.md)) adds on a ring: both ConnectX-7 cards
+([Devices past the second are never advertised](#devices-past-the-second-are-never-advertised)),
+RoCEnante over hardware-forwarded opposite-node paths
+([RoCEnante on the ring](#rocenante-on-the-ring-hardware-forwarded-opposite-node-paths)),
+and measurements of the TP4 profile on a ring.
 
 ## Why the ring needs a patch
 
@@ -186,7 +193,8 @@ Outside ring mode, `NCCL_OVERLAY_PIP=1` can be enabled independently;
 
 The serial loader disables SGLang's asynchronous weight-copy decision to avoid
 queued host-to-device copies retaining checkpoint pages in GB10's shared CPU/GPU
-memory. It is passed to every rank and defaults off outside the TP4 safe profile.
+memory. It is passed to every rank and defaults off; uncomment it in the ring block
+of `.env.tp4.example`.
 It requires `sglang.srt.model_loader.utils.should_async_load`; an incompatible
 SGLang version fails explicitly. It does not guarantee that every model or
 context configuration will fit memory.
@@ -273,3 +281,447 @@ performance, or repeat a 1M-context needle. Port/GID checks cannot establish
 cable order, end-to-end reachability, identical model revisions, or sufficient
 memory on a live cluster. The result is specific to this four-node ring; it is
 not a general multi-hop RoCE fabric or a switched-versus-ring A/B benchmark.
+
+## Devices past the second are never advertised
+
+`NCCL_IB_HCA` accepts any number of devices, and NCCL says nothing when it cannot
+use them. The switchless-cycle patch publishes at most **two** listener GIDs per
+rank — `gidSlot < 2` in `net_ib/connect.cc`, in both the original and the patched
+loop. Devices after the second are therefore absent from the handle every peer
+receives, no peer can match their subnet, and their ports carry zero bytes. The
+ring still forms and serves; it just runs on the first two devices.
+
+The symptom is easy to miss because the channel plan looks right:
+
+```
+NCCL INFO NET/IB : Using [0]rocep1s0f0:1/RoCE [1]rocep1s0f1:1/RoCE \
+                   [2]roceP2p1s0f0:1/RoCE [3]roceP2p1s0f1:1/RoCE [RO]
+NCCL INFO Channel 02/0 : 0[0] -> 1[0] [send] via NET/IB/2
+```
+
+Both lines name device 2, and it still moves nothing. What actually happens is a
+silent collapse onto the first device, visible only in the routing log:
+
+```
+NCCL INFO NET/IB: Subnet-aware routing: overriding dev 2 with dev 0
+NCCL INFO NET/IB: Subnet-aware routing: overriding dev 3 with dev 0
+```
+
+`doctor` does not detect this; check the routing records and port counters below.
+
+### Raising the cap
+
+A four-Spark board exposes its ConnectX-7 functions through **two PCI root
+domains** (`0000:` and `0002:` here), which NCCL discovers as four separate
+devices:
+
+```
+[0] rocep1s0f0    pciPath=/sys/devices/pci0000:00/.../0000:01:00.0
+[1] rocep1s0f1    pciPath=/sys/devices/pci0000:00/.../0000:01:00.0
+[2] roceP2p1s0f0  pciPath=/sys/devices/pci0002:00/.../0002:01:00.0
+[3] roceP2p1s0f1  pciPath=/sys/devices/pci0002:00/.../0002:01:00.0
+```
+
+FujitsuPolycom/sparkring's cumulative
+[`nccl-2.30.7-dual-pci-domain.patch`](https://github.com/FujitsuPolycom/sparkring/blob/main/spark_transport/nccl/DUAL_PCI_DOMAIN.md)
+raises the bound to four behind a flag, and adds a fallback that substitutes a
+device **within the same PCI root** rather than collapsing across domains. It is the
+patch recorded under [Patched NCCL provenance and installation](#patched-nccl-provenance-and-installation)
+above and already contains the switchless-cycle changes, so it must not be layered over them.
+
+```ini
+NCCL_IB_EXTENDED_IPV4_GIDS=1     # publish up to four IPv4-mapped listener GIDs
+NCCL_IB_PRESERVE_PCI_DOMAIN=1    # substitute within the selected PCI root
+NCCL_IB_ROUTE_DIAGNOSTICS=1      # one record per final QP: which device it landed on
+NCCL_IB_QPS_PER_CONNECTION=1
+```
+
+Set `IB_HCA` to all four devices and the ring uses both planes. Every value has to
+reach every rank, head and workers alike: put the four flags in `EXTRA_CONTAINER_ENV`
+in `.env.tp4`, which `start.sh` passes to the head and every worker.
+
+The flags are read at NCCL init, so the effect is visible before any request:
+
+```
+NCCL INFO NET/IB ListenerRouting format=ipv4-v1 advertised=4 observed=4
+```
+
+`advertised=2` means the cap is still in force. The routing records then stop
+collapsing: `overriding dev 3 with dev 2` stays inside the second PCI root instead
+of reaching for `dev 0`.
+
+### The second plane's network has to exist before those flags can reach it
+
+The flags raise the *publication* bound; they do not give the second card a network.
+On the four Sparks the second ConnectX-7 came cabled and up (200G, link detected) but
+unconfigured: no IPv4, MTU 1500, and the RoCE v2 GID that `NCCL_IB_GID_INDEX` selects
+(index 3 here) reading back all-zero. NCCL cannot match a subnet for a device that has
+no GID at the selected index, so the channel plan names it and the port still carries
+nothing:
+
+```text
+NET/IB : Using [0]rocep1s0f0 [1]rocep1s0f1 [2]roceP2p1s0f0 [3]roceP2p1s0f1
+Channel 02/0 : 0[0] -> 1[0] [send] via NET/IB/2      <- moves nothing
+```
+
+`port_xmit_data` on `roceP2p1s0f0` stayed flat for the whole run while the first card
+carried 100 % of inter-node traffic — the 0.00 GB column in the table below. Setting the
+four flags without this step leaves the ports where they were: the flags decide whether a
+device may be advertised, the addressing decides whether there is a GID to advertise.
+
+Both ports of the second card are part of the ring, one cable each to the two neighbours,
+with the same geometry as the first card (`f0` to the next rank's `f1`). Each node
+therefore needs one address per cable, a 9000 MTU, and a route for the two /24s it does
+not sit on: those subnets exist only at the IP layer, through a transit neighbour.
+
+A minimal template, per node as `/etc/netplan/41-sparkring-plane2.yaml`. Cable `<i>` is
+the leg rank`i` -> rank`(i+1) mod 4`; shown for rank0, the other three are the same file
+with `i` shifted and the two /24s adapted (they are placeholders — use your own scheme):
+
+```yaml
+network:
+  version: 2
+  renderer: NetworkManager        # the Sparks' fabric ports are NetworkManager-managed
+  ethernets:
+    enP2p1s0f0np0:                # -> RDMA device roceP2p1s0f0
+      addresses: [10.10.0.10/24]  # cable 0, this end
+      dhcp4: false
+      dhcp6: false
+      mtu: 9000
+      optional: true             # never block boot on it
+      routes:
+      - to: 10.10.1.0/24          # cable 1, one hop away
+        via: 10.10.0.11           # rank1's f1, on this cable
+    enP2p1s0f1np1:                # -> RDMA device roceP2p1s0f1
+      addresses: [10.10.3.11/24]  # cable 3, this end
+      dhcp4: false
+      dhcp6: false
+      mtu: 9000
+      optional: true
+      routes:
+      - to: 10.10.2.0/24          # cable 2, one hop away
+        via: 10.10.3.10           # rank3's f0, on this cable
+```
+
+`sudo netplan apply`, then confirm the four addresses and the MTU are up
+(`ip -br addr`, `ip -d link show enP2p1s0f0np0`) and that the interface names still
+map to the `IB_HCA` list you set. The network is only right when the counters agree:
+with the addressing and the four flags in place the second root moved 63.60 GB under a
+64k prefill plus 16 streams and took 49.7 % of inter-node traffic, and the routing
+record reads
+
+```text
+NET/IB: Subnet-aware routing: overriding dev 3 with dev 2 preserving PCI root pci0002:00
+```
+
+instead of collapsing to `dev 0`. Keep that order when debugging — addressing first,
+then the flags, then the counters. The `NET` subsys stays useful here: this record is
+the only place that states which root a channel landed on.
+
+Removing the plane takes two steps, not one: NetworkManager can write its own
+`/etc/netplan/90-NM-*.yaml` stanzas for these interfaces, and any of those that survive
+bring the addresses back on the next `netplan apply` (`grep -l enP2p1s /etc/netplan/*`).
+If you are rolling the plane back completely, `rm` those too and flush the addresses
+(`ip addr flush dev enP2p1s0f0np0 enP2p1s0f1np1`).
+
+### Channel count
+
+`NCCL_MIN_NCHANNELS` and `NCCL_MAX_NCHANNELS` decide how many channels share the
+devices. Four channels over four devices gives one channel per device, which is
+the mapping that reaches all of them:
+
+```ini
+NCCL_MIN_NCHANNELS=4
+NCCL_MAX_NCHANNELS=4
+```
+
+These are the ring block's values in `.env.tp4.example`.
+
+Eight channels over four devices still round-robins 0,1,2,3,0,1,2,3, so it is not
+wrong, but a four-versus-eight comparison on this workload found no serving
+benefit and 0.14 GiB more head-node shared memory
+([sparkring#193](https://github.com/FujitsuPolycom/sparkring/issues/193)).
+
+### What it is worth
+
+Measured here on four Sparks, TP4 / EP2, DSpark k=5, one 64k prefill plus 16
+concurrent streams, IB port counters before and after:
+
+| port | PCI root | before | after |
+|---|---|---:|---:|
+| `rocep1s0f0` | 0000 | 65.45 GB | 32.20 GB |
+| `rocep1s0f1` | 0000 | 65.45 GB | 32.19 GB |
+| `roceP2p1s0f0` | 0002 | **0.00 GB** | **31.80 GB** |
+| `roceP2p1s0f1` | 0002 | **0.00 GB** | **31.80 GB** |
+
+Half the traffic moves to the second plane. The total is unchanged — this spreads
+the same collectives over twice the ports, it does not make them smaller. The
+ported case is bounded by what the ring was waiting on, not by cable bandwidth:
+the ports ran at roughly 5 % of line rate under this load, so expect a low
+single-digit prefill gain and no decode change, matching the
+[contributor measurement](https://github.com/FujitsuPolycom/sparkring/blob/main/performance/records/transport/nccl-dual-domain-deepseek.md)
+of +5.43–6.82 % prefill for this exact model and runtime. Verify with counters and
+the routing records rather than trusting the channel plan.
+
+### Diagnosing it
+
+`ListenerRouting` and the routing records are logged at the `NET` level. With
+`NCCL_DEBUG_SUBSYS=INIT,ENV` they never appear and the collapse is invisible:
+
+```ini
+NCCL_DEBUG=INFO
+NCCL_DEBUG_SUBSYS=INIT,ENV,NET    # add NET while validating; drop it afterwards
+```
+
+## Pitfalls
+
+* **`EP_SIZE` is free, `TP_SIZE` is not.** The ring needs `NNODES == TP_SIZE == 4`
+  (the ring spans the tensor-parallel group). `EP_SIZE` only decides how the MoE
+  experts are grouped, so 1, 2 and 4 are accepted: 2 on the base and canary images,
+  1 on the TP4 production line.
+* **A wrong GID index is the usual failure.** All ports listed in `IB_HCA` must
+  share one nonzero IPv4-mapped RoCE v2 GID; the preflight finds it or validates
+  your `NCCL_IB_GID_INDEX` override. Management IPs need not appear in the GID table.
+* **Do not also set `NCCL_SWITCHLESS_RING_ONLY=1` with a switched fabric.** The ring
+  skips the tree, which is a performance loss when the tree is reachable.
+* **A ring is not a non-blocking fabric.** Opposite ranks talk through a transit
+  node, so a four-node ring's bisection bandwidth is one link, not two. Without the
+  opposite-node paths below, expect the decode numbers under Measured rather than the switched ones.
+
+## RoCEnante on the ring: hardware-forwarded opposite-node paths
+
+**Status: research-only**, as sparkring labels its hardware-forwarded mesh (`plan.py` writes `"status": "research-only"`).
+It is off by default, and nothing in this section changes a switched setup.
+
+RoCEnante's one-shot all-reduce and all-gather write every rank's payload straight into every
+peer's buffers, and a four-node ring has no link between opposite nodes, so out of the box a ring
+runs the production line with `SGLANG_ROCE_ALLREDUCE=0` and the collectives go through the patched
+NCCL (~56 us per decode-size all-reduce, ~90 of them per decode step). The missing path can be built
+without a switch or extra cables, in the neighbours' ConnectX-7 hardware, with the design of
+[FujitsuPolycom/sparkring](https://github.com/FujitsuPolycom/sparkring) (`cx7_hairpin_diagonal`,
+commit `f16b5f4`):
+
+- the sender's NIC re-tags the RDMA packets of the opposite-node queue pairs (flow label 16383, i.e.
+  UDP source port 65535) from EtherType 0x0800 to 0x88b5 (an RDMA-TX flow rule, `mlx5-rdma-tx-rewrite-probe`);
+- a `/32` route sends them to the neighbour on that cable;
+- on the neighbour a `skip_sw` tc flower rule matches the tag and the two MACs, restores 0x0800,
+  rewrites the destination MAC and redirects the packet out of its other port (mlx5 hairpin queues).
+
+No CPU touches the forwarded packets and the kernel forwards nothing (`nstat IpForwDatagrams` stays
+flat); a marked packet that misses the rule is dropped, never routed in software. Every rank uses
+two paths per peer over its four RDMA functions: the neighbours over their own cable, the opposite
+node through each neighbour (one path per PCIe domain). `DSV41_ROCE_RING=1` makes the SG17 overlay
+load `b12x.comm.roce_ring`, sparkring's path-aware RoCEnante (provenance and local changes in
+`runtime/b12x/roce_ring-provenance.json`), instead of `b12x.comm.roce`; unset, nothing changes.
+`DSV41_L2_PREFETCH` hooks either package.
+
+### What each step is worth
+
+Same four-Spark ring, same day, one change at a time (qeval = `scripts/qeval.py`, 75 tasks at c1;
+step time = the engine's `spec_verify_ct`, time to first token subtracted):
+
+| Step | Effect |
+|---|---|
+| NCCL ring -> RoCEnante over the mesh (c5cee32 stack, 80 KB cap) | decode step -5.2 % (median over 51 qeval tasks, faster on 50), qeval median 76.3 -> 79.5 tok/s |
+| proxy idle spins 200000 -> 20000000 (the SG17 value) | c1 step 40.6 -> 37.1 ms (-8.6 %), c2 -7 %, c4 -6 %, c8 -2 %; with 200000 the proxy was asleep in 27 % of samples during decode |
+| `hairpin_queue_size` 8192, 256 KB cap, two-wave off | c2 -1 %, c4 -1.3 %; c1 unchanged (its collectives are 50-60 KB) |
+| the TP4 stack's v2 (prefill SP, L2 prefetch, draft head) | c1-c8 step -1 to -3 %, prefill +17-18 % at 16k-128k, +10 % at 262k |
+
+### Results
+
+The TP4 production line at v2 (knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4 `7ac7123`) with the ring
+additions, built with `Dockerfile.canary-roce`, measured on the four-Spark ring the same day, against
+the switched v2 numbers (v2.1's `DSV41_PREFILL_SP_FP8` came later; it is fabric-independent and was not
+in this run; [docs/tp4.md](tp4.md) shows v2.1: prose c1 87.7, prefill ~5.8-5.9k tok/s at 16k-128k). Raw
+output: [`docs/results/tp4/ring-mesh-20260925.txt`](results/tp4/ring-mesh-20260925.txt).
+
+| | Ring (this) | Switched (v2) |
+|---|---:|---:|
+| qeval median tok/s (75 tasks), pass | 81.8 / 84.7 / 85.9 (3 runs), 71-72/75 | 83.5, 72/75 |
+| decode step, prose-type prompts | 33.3 ms (2.0 tok/step) | 33.0 ms (2.27 tok/step) |
+| decode step, code-type prompts | 38.1 ms (3.74 tok/step) | 39.2 ms (3.87 tok/step) |
+| sparkDash 1.8.8 prose c1 / c16 | 80.9 / 345.1 | 86.5 / 342.7 |
+| code c1 / c16 | 120.5 / 446.6 | 122.6 / 438.3 |
+| structured c1 / c16 | 150.2 / 547.7 | 152.4 / 572.2 |
+| json c1 / c16 | 134.2 / 671.5 | 118.9 / 659.9 |
+| prefill 16k-128k / 262k | 5,393-5,567 / 4,971 | 5,644-5,818 / 5,214 |
+| phrase needle | PASS at 1,030,651 tokens (305 s) | PASS at 1,011,084 tokens (322 s) |
+
+The step-time prompts differ (the switched run's are not published), so the two columns are near but not
+identical acceptance. Prose c1 on sparkDash is the single-prompt case under Mesh pitfalls below. Prefill
+stays 4-5 % under the switched fabric at 16k-128k and 5 % at 262k: the large prefill collectives run on
+NCCL over the ring's one-link bisection. The KV pool was 5.56 M tokens on this boot and 6.33-6.35 M on
+the two before it (the fast loader's boot-to-boot spread).
+
+### Setup
+
+1. **The ring as above**, with both planes addressed (four RDMA functions per node, MTU 9000, the
+   RoCEv2 GID at index 3), and the NIC profile sparkring's hardware forwarding was qualified on:
+   `hairpin_num_queues` 4, `flow_steering_mode` `hmfs`, eswitch `legacy`, `hw-tc-offload on` on all
+   four fabric netdevs (sparkring's
+   [driver configuration notes](https://github.com/FujitsuPolycom/sparkring/blob/main/docs/GLM53_SPARK_MTP3_MESH_QUICKSTART.md#connectx-7-driver-configuration-for-hardware-forwarding)).
+   `scripts/ring_mesh/inventory.sh` prints all of it per node; `plan.py` refuses a node whose links,
+   MTU, GID, TC offload or steering mode do not match.
+2. **The source marker**, built on every node from a sparkring checkout at `f16b5f4`
+   (source sha256 `8684a696…`; it built to `2828c07e…` here, the binary sparkring records):
+
+   ```bash
+   git clone https://github.com/FujitsuPolycom/sparkring ~/sparkring && git -C ~/sparkring checkout f16b5f4
+   sudo install -d /opt/dsv41-mesh/bin
+   cc -O2 -Wall -Wextra ~/sparkring/spark_transport/fabric/cx7_hairpin_diagonal/native/mlx5_rdma_tx_rewrite_probe.c \
+      -o /tmp/mlx5-rdma-tx-rewrite-probe -libverbs -lmlx5 && sudo install -m 755 /tmp/mlx5-rdma-tx-rewrite-probe /opt/dsv41-mesh/bin/
+   ```
+3. **The plan**, from the head, with the hosts in TP rank order (the head, then `WORKER_HOSTS`):
+
+   ```bash
+   python3 scripts/ring_mesh/plan.py --sparkring ~/sparkring --out ring-mesh spark1 spark2 spark3 spark4
+   ```
+
+   It inventories the nodes over SSH, reads the cabling from the fabric subnets, numbers the ring the
+   way sparkring's planner needs it (every f0 port cabled to the next node's f1; it refuses anything
+   else), and has sparkring's planner build the RoCEnante selection: per node two `/32` routes, two
+   tc rules and two markers. It writes `mesh-up-<host>.sh` / `mesh-down-<host>.sh` and `env.txt`,
+   the `EXTRA_CONTAINER_ENV` additions with the per-rank peer maps already translated to the TP rank
+   order (sparkring numbers the ring by cabling direction, which need not match it).
+4. **Install on every node** with the engine stopped (applying the hairpin size re-initialises each
+   fabric function); `$HOST` is that node's name as given to `plan.py`:
+
+   ```bash
+   sudo install -m 755 ring-mesh/mesh-up-$HOST.sh /opt/dsv41-mesh/mesh-up.sh
+   sudo install -m 755 ring-mesh/mesh-down-$HOST.sh /opt/dsv41-mesh/mesh-down.sh
+   sudo install -m 755 scripts/ring_mesh/hairpin.sh /opt/dsv41-mesh/
+   sudo install -m 644 scripts/ring_mesh/dsv41-mesh.service scripts/ring_mesh/dsv41-mesh-marker@.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now dsv41-mesh
+   ```
+
+   `dsv41-mesh.service` runs at every boot: it waits for the fabric links, sets `hairpin_queue_size`
+   (a `driverinit` parameter that resets at boot) and applies the routes, rules and markers; `mesh-up.sh`
+   refuses a rule that did not land in hardware. Start the engine after it is active.
+   On a first install, re-run `plan.py` once the unit is active. `plan.py` takes the RoCE size cap from the
+   hairpin queue size it finds, so a plan made before the unit set 8192 emits the safe 80 KB cap (81920)
+   instead of 262144.
+5. **Verify the path** before booting the engine: every rule shows `in_hw` (`tc -s filter show dev
+   <netdev> ingress`), and an RDMA write to the opposite node goes through the neighbour's rule, not its
+   kernel (`ib_write_lat -d <dev> -x 3 --flow_label=16383` against the opposite node's port: ~10 us at
+   61 KB here against 8.5 us to a direct neighbour; the neighbour's rule counters rise and its
+   `IpForwDatagrams` does not).
+6. **`.env.tp4`**: build `Dockerfile.canary-roce` as usual and append `env.txt` to the production
+   `EXTRA_CONTAINER_ENV`, replacing its `B12X_ROCE_HCA`, `SGLANG_ROCE_MAX_SIZE` and `DSV41_ROCE_GATHER`.
+   The boot log shows `RoCEnante ready: world=4 hcas=rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1`
+   and `DSV41_L2_PREFETCH: RoCE collectives prefetch the next weights into L2`.
+
+### The size cap and the hairpin queues
+
+The forwarded traffic crosses the neighbour in a hairpin queue, and at the driver default
+(`hairpin_queue_size` 1024) a burst of more than ~100 KB per message overflows it:
+`rx_out_of_buffer` rises on the forwarding ports, the far end counts `out_of_sequence` /
+`packet_seq_err`, and go-back-N retransmits make a 120 KB all-reduce 3-4x slower than NCCL. Measured
+in CUDA graphs, all four ranks, drops summed over all 16 functions:
+
+| all-reduce | 60 KB | 100 KB | 120 KB | 240 KB | 480 KB | 960 KB |
+|---|---:|---:|---:|---:|---:|---:|
+| queue 1024: us/op | 23 | 36 | 111-141 | 91-109 | 167-191 | 378-449 |
+| queue 1024: drops | 0 | 163 | many | many | many | many |
+| queue 8192, two-wave off: us/op | 24 | 35 | 40 | 60 | 95 | 274 (two-wave on) |
+| queue 8192: drops | 0 | 0 | 0 | 0 | 0 | 64 |
+
+At 1024 keep `SGLANG_ROCE_MAX_SIZE=DSV41_ROCE_GATHER=81920` (every c1 decode collective is 50-60 KB, so
+c1 loses nothing); at 8192 the 256 KB cap also moves c2-c4 and the draft's 129 KB vocabulary gathers.
+`plan.py` picks the cap from the smallest queue it finds. The package's two-wave schedule (direct
+paths first, forwarded paths after, from 128 KB) only costs once nothing drops:
+`B12X_ROCE_TWO_WAVE_THRESHOLD_BYTES=0` turns it off.
+
+### Mesh pitfalls
+
+- **Never re-initialise a fabric function, stop `dsv41-mesh` or a marker while the engine runs.**
+  Opposite-node traffic stops, and a re-init drops every RDMA queue pair on that function; the RoCE
+  health check then fails the step. `hairpin.sh` skips functions already at the value, so re-running
+  it with the same value is safe.
+- The marker rewrites every RDMA packet with UDP source port 65535 on its device, whatever the
+  destination: keep that port reserved on the fabric.
+- Without the mesh neither package has a path to the opposite node (`DSV41_ROCE_RING=1` or not): a
+  ring without it runs `SGLANG_ROCE_ALLREDUCE=0` and no `DSV41_ROCE_GATHER`, as before.
+- **Measuring.** The mesh changes the reduction order, so sparkDash's single greedy prose prompt takes
+  a different text and its acceptance moves with it: here prose c1 read 72.0 on the mesh against 76.4 on
+  NCCL while the step was 5 % faster. Compare step time (`spec_verify_ct`) or qeval's median over its
+  75 tasks; that median itself moves 2-3 % from run to run (81.8 / 84.7 / 85.9 on one boot here), so take
+  the median of several runs.
+- CPU pinning does not help: the scheduler on the X925 cores measured -5.5 %, the proxy threads alone
+  on dedicated X925 cores neutral.
+
+Rollback: `DSV41_ROCE_RING=0 SGLANG_ROCE_ALLREDUCE=0` without `DSV41_ROCE_GATHER` in `.env.tp4`, then
+`sudo systemctl disable --now dsv41-mesh` on every node (removes the markers, rules and routes).
+
+## Measured on the TP4 profile
+
+The ring without the opposite-node paths (collectives on NCCL): four GB10 Sparks in a ring (`a-b-c-d-a`, no switch), TP4 / EP2, 1M context,
+DSpark k=5, local weights (`NFS_SHARE=0`), canary image, ring switch on. sparkDash's
+benchmark panel, one engine, no other load. Measured by [@Saolence](https://github.com/Saolence)
+on the TP4 profile's own ring launcher, whose switch and NCCL settings are the ones above.
+
+Boot, first time:
+
+```
+NCCL INFO Connected all rings, use ring PXN 0 GDR 0
+NCCL INFO NCCL_SWITCHLESS_RING_ONLY set by environment to 1.
+NCCL INFO Tree transport setup disabled by NCCL_SWITCHLESS_RING_ONLY
+NCCL INFO PAT transport setup disabled by NCCL_SWITCHLESS_RING_ONLY
+parallel: nnodes=4 TP=4 EP=2
+```
+
+All four ranks healthy, `/health` 200, `--enable-cache-report` live
+(cold request `prompt_tokens_details: None`, warm `{'cached_tokens': 1024}`).
+
+### Prefill, cold
+
+| context | 1k | 4k | 8k | 16k | 32k | 64k |
+|---|---:|---:|---:|---:|---:|---:|
+| prompt tokens | 1,041 | 4,116 | 8,213 | 16,405 | 32,793 | 65,555 |
+| TTFT | 406 ms | 1.11 s | 2.01 s | 3.89 s | 7.67 s | 15.43 s |
+| tok/s | 2563 | 3712 | 4081 | 4218 | 4274 | 4249 |
+
+**Caveat, the same one as the TP4 prefill table in [docs/tp4.md](tp4.md):** sparkDash's prefill filler is one
+repeated token, so every filler token hits the same Engram row and the row cache
+(`DSV41_CACHE_GIB`) inflates the 16k-128k column by roughly 9-20 % (reported by
+koldfrontier in MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks#21). Treat the shape as real and
+the absolute numbers as an upper bound; a cold single request with a 53,613-token natural
+prompt took **17 s** on the same boot, which is the same order as the 32k row above.
+
+### Decode, 400 output tokens
+
+Prose:
+
+| concurrent streams | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| aggregate tok/s | 60.5 | 82.9 | 116.4 | 186.1 |
+| per stream | 60.5 | 41.4 | 30.3 | 24.0 |
+| TTFT | 182 ms | 209 ms | 263 ms | 286 ms |
+
+Code:
+
+| concurrent streams | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| aggregate tok/s | 107.5 | 189.6 | 326.4 | 521.6 |
+| per stream | 107.5 | 94.8 | 81.6 | 65.2 |
+| TTFT | 257 ms | 313 ms | 381 ms | 533 ms |
+
+Decode is where a ring is the right trade: aggregate scales close to linearly through
+eight streams (prose 60.5 → 186.1, code 107.5 → 521.6) while per-stream decay stays
+gentle, which is what the 16-slot decoder and DSpark are for. Prefill is where the
+bisection shows: ranks on opposite sides of the ring talk through a transit node, so a
+four-node ring's bisection is one link, not two. That is the price of having no switch,
+not a way to beat one.
+
+### Credits for this half
+
+- The four-Spark ring launcher: [@Saolence](https://github.com/Saolence)
+  ([#3](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/3)), carried forward in
+  [#19](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/pull/19) by
+  [@carlosduque-incoxe](https://github.com/carlosduque-incoxe); the dual-PCI-domain findings and
+  the TP4-profile ring measurements above are also @Saolence's.
+- RoCEnante on the ring (`DSV41_ROCE_RING`, `b12x.comm.roce_ring`, `scripts/ring_mesh/`): rsync
+  ([@rchmagos](https://github.com/rchmagos)), built on
+  [FujitsuPolycom/sparkring](https://github.com/FujitsuPolycom/sparkring) (the hardware-forwarded
+  opposite-node paths, the fabric planner, the RDMA-TX marker and the path-aware RoCEnante package),
+  which derives from RoCEnante by [local-inference-lab/b12x](https://github.com/local-inference-lab/b12x).
+- The NCCL transport patch: [FujitsuPolycom/sparkring](https://github.com/FujitsuPolycom/sparkring).
