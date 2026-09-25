@@ -34,7 +34,7 @@ RUN PYTHONPATH=/opt/b12x:/opt/b12x_next python3 -c "import b12x.comm.roce, b12x_
 WORKDIR /opt/dsv41
 COPY adapter /opt/dsv41/adapter
 RUN g++ -O2 -Wall -Wextra -Werror -std=c++17 -shared -fPIC -pthread \
-    adapter/row_store.cpp -o adapter/librow_store.so
+    -DDSV41_ROW_STORE_DRM adapter/row_store.cpp -o adapter/librow_store.so
 COPY runtime/flash_mla_sm120.canary.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 COPY boot.py /opt/dsv41/boot.py
 COPY scripts /opt/dsv41/scripts

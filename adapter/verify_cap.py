@@ -151,7 +151,8 @@ def install_gate(module):
     module._dsv41_verify_cap = True
     original = module.moe_fused_gate
     fused = None
-    if os.environ.get("DSV41_ROUTER_LIVE", "0").strip() not in ("0", "", "off", "false"):
+    if (os.environ.get("DSV41_LAUNCHER") == "tp4"
+            and os.environ.get("DSV41_ROUTER_LIVE", "0").strip() not in ("0", "", "off", "false")):
         # DSV41_ROUTER_LIVE: the router loads the anchor's scores for dead rows (no remap launch)
         from router_live import build
         fused = build(module)

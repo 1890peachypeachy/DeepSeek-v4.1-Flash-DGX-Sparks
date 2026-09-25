@@ -24,8 +24,15 @@ def build_source():
     return build[:build.index("\n}\n")]
 
 
-def rsync_excludes():
-    return re.findall(r"--exclude '([^']+)'", build_source())
+def rsync_excludes(which="tp4"):
+    """Excludes of one rsync arm. `tp4` is start-tp4.sh; `start` is ./start.sh."""
+    build = build_source()
+    begin, end = {
+        "tp4": ("# rsync-tp4", "# end-rsync-tp4"),
+        "start": ("# rsync-start", "# end-rsync-start"),
+    }[which]
+    arm = build.split(begin, 1)[1].split(end, 1)[0]
+    return re.findall(r"--exclude '([^']+)'", arm)
 
 
 def launcher_source():
@@ -77,7 +84,7 @@ class BuildTargetTests(unittest.TestCase):
               docker() { printf '%s\n' "$*" >> "$LOG"
                          case "$1 $2" in "image inspect") echo arm64;; esac; }
               cmd_build
-            """, Path(tmp), {"LOG": str(log)})
+            """, Path(tmp), {"LOG": str(log), "DSV41_LAUNCHER": "tp4"})
             calls = [line for line in log.read_text().splitlines() if line.startswith("build ")]
             self.assertEqual(len(calls), 1, log.read_text())
             self.assertIn(f"-f {ROOT}/Dockerfile.canary", calls[0])
@@ -88,6 +95,22 @@ class BuildTargetTests(unittest.TestCase):
         self.assertIn('docker build -f "$ROOT/$dockerfile" -t "$IMAGE"', build)
         workers = build[build.index("for h in \"${WORKER_HOSTS[@]}\""):]
         self.assertIn('docker build -f $(printf \'%q\' "$dockerfile")', workers)
+
+    def test_start_sh_builds_the_default_dockerfile(self):
+        """Without DSV41_LAUNCHER, BUILD_DOCKERFILE and BUILD_ARGS are ignored."""
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "SSH_IDENTITY.pub").write_text("ssh-ed25519 AAAA test\n")
+            log = Path(tmp, "docker.log")
+            shell(r"""
+              BUILD_DOCKERFILE=Dockerfile.canary
+              BUILD_ARGS="--build-arg PIP_INDEX=https://mirror.invalid/simple"
+              WORKER_HOSTS=()
+              docker() { printf '%s\n' "$*" >> "$LOG"
+                         case "$1 $2" in "image inspect") echo arm64;; esac; }
+              cmd_build
+            """, Path(tmp), {"LOG": str(log)})
+            calls = [line for line in log.read_text().splitlines() if line.startswith("build ")]
+            self.assertEqual(calls, [f"build -t dsv41-3x-spark:local {ROOT}"])
 
     def test_a_dockerfile_outside_the_repository_is_rejected(self):
         """The workers only see what the rsync staged, so an absolute path cannot work."""
@@ -118,11 +141,17 @@ class RsyncExcludesTests(unittest.TestCase):
                              "the checkpoint directory at the repository root was copied")
 
     def test_every_exclude_is_anchored(self):
-        """A bare name matches any path component; all five are root-level artifacts."""
-        for pattern in rsync_excludes():
+        """A bare name matches any path component; the TP4 arm anchors root-level artifacts."""
+        for pattern in rsync_excludes("tp4"):
             if pattern in (".env", ".env.tp4"):
                 continue  # exact filenames, meant to be protected everywhere
             self.assertTrue(pattern.startswith("/"), f"unanchored exclude: {pattern}")
+
+    def test_start_sh_keeps_its_excludes(self):
+        self.assertEqual(
+            rsync_excludes("start"),
+            [".env", ".env.tp4", "state", "state-tp4", "logs", "logs-tp4", "models", "engram"],
+        )
 
 
 class ExtraContainerEnvTests(unittest.TestCase):
@@ -146,16 +175,25 @@ class ExtraContainerEnvTests(unittest.TestCase):
         pairs = lambda a: [a[i + 1] for i, x in enumerate(a[:-1]) if x == "-e"]
         return pairs(out[:split]), pairs(out[split + 1:])
 
+    def test_start_sh_ignores_the_tp4_env_channel(self):
+        head, worker = self.args({"EXTRA_CONTAINER_ENV": "DSV41_MOE_B12X_NEXT=1"})
+        for env in (head, worker):
+            self.assertNotIn("DSV41_LAUNCHER=tp4", env)
+            self.assertFalse(any(e.startswith("DSV41_SHARED_PAD_K=") for e in env))
+            self.assertNotIn("DSV41_MOE_B12X_NEXT=1", env)
+
     def test_unset_changes_nothing(self):
-        head, worker = self.args({})
+        head, worker = self.args({"DSV41_LAUNCHER": "tp4"})
         self.assertIn("DSV41_WO_A_W8=0", head)
         self.assertIn("DSV41_WO_A_W8=0", worker)
         self.assertIn("DSV41_SHARED_PAD_K=0", head)
         self.assertIn("DSV41_SHARED_PAD_K=0", worker)
+        self.assertIn("DSV41_LAUNCHER=tp4", head)
+        self.assertIn("DSV41_LAUNCHER=tp4", worker)
 
     def test_set_keys_override_once_and_new_keys_are_added(self):
         extra = "DSV41_WO_A_W8=1 DSV41_SHARED_PAD_K=1 DSV41_MOE_B12X_NEXT=1 SGLANG_DSPARK_FOLDED_SAMPLING=2"
-        head, worker = self.args({"EXTRA_CONTAINER_ENV": extra})
+        head, worker = self.args({"DSV41_LAUNCHER": "tp4", "EXTRA_CONTAINER_ENV": extra})
         for env in (head, worker):
             for kv in extra.split():
                 self.assertEqual(sum(e.split("=", 1)[0] == kv.split("=", 1)[0] for e in env), 1, kv)
@@ -166,7 +204,8 @@ class ExtraContainerEnvTests(unittest.TestCase):
             d = Path(tmp)
             Path(d, "MODEL_DIR").mkdir()
             with self.assertRaises(AssertionError):
-                shell('head=(); docker_common_args head "$HEAD_IP" 3', d, {"EXTRA_CONTAINER_ENV": "NOTAPAIR"})
+                shell('head=(); docker_common_args head "$HEAD_IP" 3', d,
+                      {"DSV41_LAUNCHER": "tp4", "EXTRA_CONTAINER_ENV": "NOTAPAIR"})
 
 
 class CanaryDockerfileTests(unittest.TestCase):

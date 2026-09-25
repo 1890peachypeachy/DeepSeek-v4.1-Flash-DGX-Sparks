@@ -477,8 +477,8 @@ NCCL_DEBUG_SUBSYS=INIT,ENV,NET    # add NET while validating; drop it afterwards
 
 * **`EP_SIZE` is free, `TP_SIZE` is not.** The ring needs `NNODES == TP_SIZE == 4`
   (the ring spans the tensor-parallel group). `EP_SIZE` only decides how the MoE
-  experts are grouped, so 1, 2 and 4 are accepted: 2 on the base and canary images,
-  1 on the TP4 production line.
+  experts are grouped. `./start.sh` still requires `EP_SIZE=4`. `./start-tp4.sh`
+  also accepts 2 and 1: 2 on the base and canary images, 1 on the TP4 production line.
 * **A wrong GID index is the usual failure.** All ports listed in `IB_HCA` must
   share one nonzero IPv4-mapped RoCE v2 GID; the preflight finds it or validates
   your `NCCL_IB_GID_INDEX` override. Management IPs need not appear in the GID table.

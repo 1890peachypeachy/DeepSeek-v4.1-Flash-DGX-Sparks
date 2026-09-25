@@ -2,8 +2,9 @@
 
 - the TP4 variant builds the same fp8 copy as adapter/draft_head_fp8.py (bitwise) and refuses a
   drifted draft class;
-- sitecustomize installs draft_head_fp8 unless DSV41_DRAFT_HEAD_FP8_IMPL=tp4, and nothing when
-  DSV41_DRAFT_HEAD_FP8 is off. The Triton kernels themselves are checked on the Spark.
+- sitecustomize installs draft_head_fp8_tp4 only when start-tp4.sh set DSV41_LAUNCHER=tp4
+  and DSV41_DRAFT_HEAD_FP8_IMPL=tp4. ./start.sh always installs draft_head_fp8.py.
+  Nothing is installed when DSV41_DRAFT_HEAD_FP8 is off. The Triton kernels are checked on the Spark.
 """
 import importlib.util
 import os
@@ -47,7 +48,8 @@ def check_selection():
             pass
 
     for env, expected in (({"DSV41_DRAFT_HEAD_FP8": "1"}, "default"),
-                          ({"DSV41_DRAFT_HEAD_FP8": "1", "DSV41_DRAFT_HEAD_FP8_IMPL": "tp4"}, "tp4"),
+                          ({"DSV41_DRAFT_HEAD_FP8": "1", "DSV41_DRAFT_HEAD_FP8_IMPL": "tp4"}, "default"),
+                          ({"DSV41_LAUNCHER": "tp4", "DSV41_DRAFT_HEAD_FP8": "1", "DSV41_DRAFT_HEAD_FP8_IMPL": "tp4"}, "tp4"),
                           ({"DSV41_DRAFT_HEAD_FP8": "1", "DSV41_DRAFT_HEAD_FP8_IMPL": ""}, "default"),
                           ({"DSV41_DRAFT_HEAD_FP8": "0", "DSV41_DRAFT_HEAD_FP8_IMPL": "tp4"}, None)):
         calls = []

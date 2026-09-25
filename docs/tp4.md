@@ -2,10 +2,11 @@
 
 A measured TP4 serving line for four DGX Spark (GB10) nodes, built on this repository's launcher
 (`start-tp4.sh` → `start.sh`), image layout, NVMe Engram row store, b12x MXFP8 route and memory
-model. Everything it adds is opt-in: a profile (`.env.tp4.example`), two images
-(`Dockerfile.canary`, `Dockerfile.canary-roce`) and gated adapters that do nothing unless their
-switch is set. The 3-Spark profile (`.env`, `start.sh`) and the default `Dockerfile` keep their
-behaviour.
+model. Everything it adds is armed only by `./start-tp4.sh`, which sets `DSV41_LAUNCHER=tp4`
+before it execs `start.sh`. That flag is what turns on the named Dockerfile, `EXTRA_CONTAINER_ENV`,
+the anchored worker rsync, EP 1 or 2 on the ring, and the production adapter hooks. The switches
+still do nothing until the profile sets them. `./start.sh` leaves the flag unset, so the 3-Spark
+profile (`.env`, `start.sh`) and the default `Dockerfile` keep their behaviour.
 
 The per-change history, every earlier measurement and the experiments that were tried and not
 adopted are in [knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4)

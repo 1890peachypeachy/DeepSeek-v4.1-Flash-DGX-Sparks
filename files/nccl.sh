@@ -53,13 +53,21 @@ nccl_validate_config() {
     return 1
   fi
   [[ "${NCCL_SWITCHLESS_RING_ONLY:-0}" == 1 ]] || return 0
-  # The ring spans the tensor-parallel group, so NNODES = TP_SIZE = 4. EP_SIZE only groups
-  # the MoE experts inside it: 4, 2 and 1 all run on a ring (the TP4 production line is EP 1).
-  if [[ "$NNODES" != 4 || "$TP_SIZE" != 4 || ! "$EP_SIZE" =~ ^[124]$ ||
+  # The ring spans the tensor-parallel group, so NNODES = TP_SIZE = 4. ./start.sh still
+  # requires EP_SIZE=4. start-tp4.sh (DSV41_LAUNCHER=tp4) also accepts 2 and 1: EP only
+  # groups the MoE experts inside the ring, and the TP4 production line runs EP 1.
+  local ep_ok=0 ep_msg="EP_SIZE=4"
+  if [[ "$EP_SIZE" == 4 ]]; then
+    ep_ok=1
+  elif [[ "${DSV41_LAUNCHER:-}" == tp4 && "$EP_SIZE" =~ ^[12]$ ]]; then
+    ep_ok=1
+    ep_msg="EP_SIZE 1, 2 or 4"
+  fi
+  if [[ "$NNODES" != 4 || "$TP_SIZE" != 4 || "$ep_ok" != 1 ||
         "$NCCL_OVERLAY_PIP" != 1 || "${NCCL_ALGO:-Ring}" != Ring ||
         "$NCCL_NET" != IB || "$NCCL_IB_DISABLE" != 0 ||
         "${NCCL_IB_SUBNET_AWARE_ROUTING:-1}" != 1 ]]; then
-    echo 'Ring requires NNODES=TP_SIZE=4, EP_SIZE 1, 2 or 4, NCCL_OVERLAY_PIP=1, NCCL_ALGO=Ring, NCCL_NET=IB, NCCL_IB_DISABLE=0 and subnet-aware routing=1' >&2
+    echo "Ring requires NNODES=TP_SIZE=4, $ep_msg, NCCL_OVERLAY_PIP=1, NCCL_ALGO=Ring, NCCL_NET=IB, NCCL_IB_DISABLE=0 and subnet-aware routing=1" >&2
     return 1
   fi
   local minimum="${NCCL_MIN_NCHANNELS:-4}" maximum="${NCCL_MAX_NCHANNELS:-32}"

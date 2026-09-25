@@ -28,7 +28,14 @@ def fake_module(paths, contents):
     return mod
 
 
-def main():
+def scenario(tp4):
+    if tp4:
+        os.environ["DSV41_LAUNCHER"] = "tp4"
+    else:
+        os.environ.pop("DSV41_LAUNCHER", None)
+    for key in ("SGLANG_RUN_ID", "DSV41_REPLICATED_SPLIT", "DSV41_WO_A_W8_DRAFT",
+                "DSV41_VERIFY_CAP", "SGLANG_SOMETHING_SHAPED"):
+        os.environ.pop(key, None)
     d = Path(tempfile.mkdtemp())
     meta = {"flashinfer": "0.6.18", "arch": "sm121"}
     paths = {}
@@ -42,7 +49,10 @@ def main():
     ak.install(mod)
     env = {"cuda": "13.0"}
     assert mod._autotune_cache_digest(paths[0], env) == "", "no sidecar yet: must not be kept"
-    assert not paths[0].exists(), "a cache without a matching sidecar must be deleted (forces a re-tune)"
+    if tp4:
+        assert not paths[0].exists(), "tp4 digest deletes a cache without a matching sidecar"
+    else:
+        assert paths[0].exists(), "start.sh digest does not delete; the context does"
     for rank in (0, 1):                                  # a tuning boot writes the caches and sidecars
         with mod.flashinfer_autotune_context(rank):
             pass
@@ -55,15 +65,23 @@ def main():
     assert d0 and d0 == d1, "disjoint EP shape sets with matching launches must digest alike"
     ak.sidecar(paths[1]).write_text("other-launch\n")
     assert mod._autotune_cache_digest(paths[1], env) == "", "a changed launch must drop the cache"
-    assert not paths[1].exists(), "and delete it, so no rank can load it"
+    if tp4:
+        assert not paths[1].exists(), "and delete it, so no rank can load it"
+    else:
+        assert paths[1].exists(), "start.sh leaves the file for the context to drop"
     fp_before = ak.launch_fingerprint()
     os.environ["SGLANG_RUN_ID"] = "sglang-run-1.0-1"   # per boot, set by the engine
     assert ak.launch_fingerprint() == fp_before
     os.environ["SGLANG_RUN_ID"] = "sglang-run-2.0-2"
     assert ak.launch_fingerprint() == fp_before
-    os.environ["DSV41_REPLICATED_SPLIT"] = "wqkv_a"      # decode-side switch: volatile
-    assert ak.launch_fingerprint() == fp_before
-    os.environ["DSV41_WO_A_W8_DRAFT"] = "1"              # draft einsum route: volatile
+    os.environ["DSV41_REPLICATED_SPLIT"] = "wqkv_a"
+    if tp4:
+        assert ak.launch_fingerprint() == fp_before, "decode-side switch is volatile on the TP4 launcher"
+    else:
+        assert ak.launch_fingerprint() != fp_before, "start.sh still fingerprints this switch"
+    os.environ.pop("DSV41_REPLICATED_SPLIT")
+    fp_before = ak.launch_fingerprint()
+    os.environ["DSV41_WO_A_W8_DRAFT"] = "1"              # draft einsum route: volatile on both paths
     assert ak.launch_fingerprint() == fp_before
     os.environ["DSV41_VERIFY_CAP"] = "conf:0.1"          # A/B-neutral switch: same fingerprint
     assert ak.launch_fingerprint() == ak.launch_fingerprint()
@@ -72,6 +90,11 @@ def main():
     assert ak.launch_fingerprint() == fp_a
     os.environ["SGLANG_SOMETHING_SHAPED"] = "1"
     assert ak.launch_fingerprint() != fp_a
+
+
+def main():
+    scenario(False)
+    scenario(True)
     print("test_autotune_keep: ok")
 
 

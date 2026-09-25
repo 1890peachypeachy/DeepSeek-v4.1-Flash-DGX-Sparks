@@ -4,6 +4,10 @@ import importlib.machinery
 import os
 import sys
 
+def _tp4_launcher():
+    """True only inside containers started by start-tp4.sh (DSV41_LAUNCHER=tp4)."""
+    return os.environ.get('DSV41_LAUNCHER', '') == 'tp4'
+
 class EngramLoader(importlib.abc.Loader):
     def __init__(self, original):
         self.original = original
@@ -35,24 +39,25 @@ class EngramLoader(importlib.abc.Loader):
         elif module.__name__ == 'sglang.srt.layers.quantization.fp8_utils':
             from mxfp8_b12x import install
             install(module)
-            # AFTER b12x, so this wraps its wrapper rather than the original.
-            # Gated on DSV41_SHARED_PAD_K, inactive by default.
-            from shared_pad_k import install as install_shared_pad
-            install_shared_pad(module)
-            # Gated on DSV41_L2_PREFETCH: record which MXFP8 weights follow each RoCE collective
-            # (adapter/l2_prefetch.py). Outermost wrapper; it only records the weight pointer.
-            if os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', ''):
-                from l2_prefetch import install_fp8_utils as install_l2_prefetch_fp8
-                install_l2_prefetch_fp8(module)
+            # TP4 only, and AFTER b12x, so shared_pad wraps its wrapper rather than the original.
+            # Gated on DSV41_SHARED_PAD_K inside the module. L2 prefetch records which MXFP8
+            # weights follow each RoCE collective; outermost wrapper, weight pointer only.
+            if _tp4_launcher():
+                from shared_pad_k import install as install_shared_pad
+                install_shared_pad(module)
+                if os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', ''):
+                    from l2_prefetch import install_fp8_utils as install_l2_prefetch_fp8
+                    install_l2_prefetch_fp8(module)
         elif module.__name__ == 'sglang.srt.layers.quantization.fp8':
             from mxfp8_b12x import install_fp8
             install_fp8(module)
-            from shared_pad_k import install_fp8 as install_shared_pad_fp8
-            install_shared_pad_fp8(module)
+            if _tp4_launcher():
+                from shared_pad_k import install_fp8 as install_shared_pad_fp8
+                install_shared_pad_fp8(module)
         elif module.__name__ == 'sglang.srt.model_executor.model_runner':
             from prefill_empty_cache import install
             install(module)
-        elif module.__name__ == 'sglang.srt.layers.attention.deepseek_v4_backend':
+        elif module.__name__ == 'sglang.srt.layers.attention.deepseek_v4_backend' and _tp4_launcher():
             # sglang#39187 backport: dense prefill indexer scored in bounded row chunks.
             # Gate checked BEFORE the import so a disabled flag imports nothing. v1 targets
             # the dev-dsv41 image backend (self.candidate_masks); v3 is the PR for
@@ -72,14 +77,15 @@ class EngramLoader(importlib.abc.Loader):
         elif module.__name__ == 'sglang.srt.entrypoints.openai.serving_chat':
             from encoding_compat import install_serving_chat
             install_serving_chat(module)
-        elif module.__name__ == 'sglang.srt.model_loader.weight_utils':
+        elif module.__name__ == 'sglang.srt.model_loader.weight_utils' and _tp4_launcher():
             # Gated on DSV41_FAST_LOAD: this rank's tensors are read eagerly by a thread
             # pool instead of page-faulted through the loader's mmap (adapter/fast_load.py).
             from fast_load import install_weight_utils
             install_weight_utils(module)
         elif module.__name__ == 'sglang.srt.models.deepseek_v4':
-            from fast_load import install_deepseek_v4
-            install_deepseek_v4(module)
+            if _tp4_launcher():
+                from fast_load import install_deepseek_v4
+                install_deepseek_v4(module)
             # Gated on DSV41_WO_A_W8: verify/draft wo_a reads its fp8 checkpoint bytes.
             if os.environ.get('DSV41_WO_A_W8', '0').strip() not in ('0', 'off', 'false', ''):
                 from wo_a_w8 import install_model as install_wo_a_w8
@@ -88,15 +94,16 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_VERIFY_CAP', '').strip() not in ('', '0', 'off'):
                 from verify_cap import install_model as install_verify_cap_model
                 install_verify_cap_model(module)
-            # Gated on DSV41_PREFILL_SP=comm|1: prefill sequence parallel (adapter/prefill_sp.py).
+            # TP4 only. DSV41_PREFILL_SP=comm|1: prefill sequence parallel (adapter/prefill_sp.py).
             # DSV41_PREFILL_SP_DEBUG alone (fingerprints on an otherwise stock boot) also installs it.
-            if (os.environ.get('DSV41_PREFILL_SP', '0').strip() not in ('0', 'off', 'false', '')
+            if _tp4_launcher() and (
+                    os.environ.get('DSV41_PREFILL_SP', '0').strip() not in ('0', 'off', 'false', '')
                     or os.environ.get('DSV41_PREFILL_SP_DEBUG', '').strip()):
                 from prefill_sp import install as install_prefill_sp
                 install_prefill_sp(module)
-            # Gated on DSV41_L2_PREFETCH: brackets decode/verify forwards so each RoCE collective
+            # TP4 only. DSV41_L2_PREFETCH: brackets decode/verify forwards so each RoCE collective
             # forks an L2 prefetch of the weights that follow it (adapter/l2_prefetch.py).
-            if os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', ''):
+            if _tp4_launcher() and os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', ''):
                 from l2_prefetch import install_model as install_l2_prefetch_model
                 install_l2_prefetch_model(module)
         elif module.__name__ == 'sglang.srt.models.deepseek_v4_dspark':
@@ -105,21 +112,22 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_VERIFY_CAP', '').strip().startswith('conf:'):
                 from verify_cap import install_dspark as install_verify_cap_dspark
                 install_verify_cap_dspark(module)
-            from fast_load import install_dspark
-            install_dspark(module)
+            if _tp4_launcher():
+                from fast_load import install_dspark
+                install_dspark(module)
             if os.environ.get('DSV41_WO_A_W8', '0').strip() not in ('0', 'off', 'false', ''):
                 from wo_a_w8 import install_dspark as install_wo_a_w8_dspark
                 install_wo_a_w8_dspark(module)
-            # Gated on DSV41_DRAFT_MAIN_PROJ_SPLIT: the draft's replicated main_proj column-split over TP
-            # (fp8 shard + all-gather; target untouched).
-            if os.environ.get('DSV41_DRAFT_MAIN_PROJ_SPLIT', '0').strip() not in ('0', 'off', 'false', ''):
+            # TP4 only. DSV41_DRAFT_MAIN_PROJ_SPLIT: the draft's replicated main_proj column-split
+            # over TP (fp8 shard + all-gather; target untouched).
+            if _tp4_launcher() and os.environ.get('DSV41_DRAFT_MAIN_PROJ_SPLIT', '0').strip() not in ('0', 'off', 'false', ''):
                 from draft_main_proj import install as install_draft_main_proj
                 install_draft_main_proj(module)
             # Gated on DSV41_DRAFT_HEAD_FP8: the draft's LM head from an fp8 copy (target untouched).
-            # DSV41_DRAFT_HEAD_FP8_IMPL=tp4 (TP4 profile) selects the batch-sized row tiles of
-            # draft_head_fp8_tp4.py; otherwise draft_head_fp8.py as before.
+            # On the TP4 launcher, DSV41_DRAFT_HEAD_FP8_IMPL=tp4 selects the batch-sized row tiles of
+            # draft_head_fp8_tp4.py. ./start.sh always installs draft_head_fp8.py.
             if os.environ.get('DSV41_DRAFT_HEAD_FP8', '0').strip() not in ('0', 'off', 'false', ''):
-                if os.environ.get('DSV41_DRAFT_HEAD_FP8_IMPL', '').strip() == 'tp4':
+                if _tp4_launcher() and os.environ.get('DSV41_DRAFT_HEAD_FP8_IMPL', '').strip() == 'tp4':
                     from draft_head_fp8_tp4 import install as install_draft_head_fp8
                 else:
                     from draft_head_fp8 import install as install_draft_head_fp8
@@ -162,40 +170,40 @@ class EngramLoader(importlib.abc.Loader):
             if os.environ.get('DSV41_AUTOTUNE_KEEP', '0').strip() not in ('0', 'off', 'false', ''):
                 from autotune_keep import install as install_autotune_keep
                 install_autotune_keep(module)
-        elif module.__name__ == 'sglang.srt.layers.linear':
+        elif _tp4_launcher() and module.__name__ == 'sglang.srt.layers.linear':
             # Gated on DSV41_REPLICATED_SPLIT=<prefix suffixes>: chosen ReplicatedLinear layers
             # column-split over TP, enabled per layer only when bit-identical on every rank.
             if os.environ.get('DSV41_REPLICATED_SPLIT', '').strip():
                 from replicated_split import install as install_replicated_split
                 install_replicated_split(module)
-        elif module.__name__ == 'sglang.srt.distributed.device_communicators.pynccl':
+        elif _tp4_launcher() and module.__name__ == 'sglang.srt.distributed.device_communicators.pynccl':
             # Gated on DSV41_ROCE_GATHER=<max bytes per rank>: small TP all-gathers (the draft's
             # vocab-parallel logits) take the RoCEnante one-shot kernel instead of NCCL.
             if os.environ.get('DSV41_ROCE_GATHER', '0').strip() not in ('', '0'):
                 from roce_gather import install as install_roce_gather
                 install_roce_gather(module)
-        elif module.__name__ == 'sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe':
+        elif _tp4_launcher() and module.__name__ == 'sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe':
             # Gated on DSV41_MOE_B12X_NEXT: routed experts on b12x main (package b12x_next), which
             # also runs EP_SIZE=1 at TP4 (N=576 per rank). Gate checked BEFORE the import.
             if os.environ.get('DSV41_MOE_B12X_NEXT', '0').strip() not in ('0', 'off', 'false', ''):
                 from moe_b12x_next import install_method as install_moe_b12x_next
                 install_moe_b12x_next(module)
-        elif module.__name__ == 'sglang.srt.layers.moe.moe_runner.flashinfer_cutlass':
+        elif _tp4_launcher() and module.__name__ == 'sglang.srt.layers.moe.moe_runner.flashinfer_cutlass':
             if os.environ.get('DSV41_MOE_B12X_NEXT', '0').strip() not in ('0', 'off', 'false', ''):
                 from moe_b12x_next import install_runner as install_moe_b12x_next_runner
                 install_moe_b12x_next_runner(module)
-        elif module.__name__ == 'sglang.kernels.ops.layernorm.mhc':
+        elif _tp4_launcher() and module.__name__ == 'sglang.kernels.ops.layernorm.mhc':
             # Gated on DSV41_HC_FUSED: prefill-size hc mix stats in one K walk, bit-identical to
             # the stock split-K + reduce (adapter/hc_fused.py). Gate checked BEFORE the import.
             if os.environ.get('DSV41_HC_FUSED', '0').strip() not in ('0', 'off', 'false', ''):
                 from hc_fused import install as install_hc_fused
                 install_hc_fused(module)
-        elif module.__name__ == 'sglang.srt.models.deepseek_v2':
+        elif _tp4_launcher() and module.__name__ == 'sglang.srt.models.deepseek_v2':
             # Gated on DSV41_L2_PREFETCH: the bf16 router (tiny_gemm_bf16) is recorded too.
             if os.environ.get('DSV41_L2_PREFETCH', '0').strip() not in ('0', 'off', 'false', ''):
                 from l2_prefetch import install_router as install_l2_prefetch_router
                 install_l2_prefetch_router(module)
-        elif module.__name__ in ('b12x.comm.roce.roce_oneshot', 'b12x.comm.roce_ring.roce_oneshot'):
+        elif _tp4_launcher() and module.__name__ in ('b12x.comm.roce.roce_oneshot', 'b12x.comm.roce_ring.roce_oneshot'):
             # Gated on DSV41_L2_PREFETCH: RoCEnante all-reduce/all-gather fork the prefetch branch.
             # Outside sglang; the finder sees its first import whichever package imports it first,
             # and install_model re-checks sys.modules in case it was imported before the finder.
@@ -224,15 +232,15 @@ class EngramFinder(importlib.abc.MetaPathFinder):
         if (fullname == 'sglang.srt.model_loader.utils' and
                 os.environ.get('DSV41_SERIAL_WEIGHT_LOAD', '0') != '1'):
             return None
+        # The second tuple is the TP4 production line. start-tp4.sh is what puts
+        # DSV41_LAUNCHER=tp4 in the container; ./start.sh never intercepts these.
         if fullname not in ('sglang.srt.layers.engram',
                             'sglang.srt.model_loader.utils',
                             'sglang.srt.layers.quantization.fp8_utils',
                             'sglang.srt.layers.quantization.fp8',
                             'sglang.srt.model_executor.model_runner',
-                            'sglang.srt.layers.attention.deepseek_v4_backend',
                             'sglang.srt.entrypoints.openai.encoding_dsv41',
                             'sglang.srt.entrypoints.openai.serving_chat',
-                            'sglang.srt.model_loader.weight_utils',
                             'sglang.srt.models.deepseek_v4',
                             'sglang.srt.models.deepseek_v4_dspark',
                             'sglang.srt.speculative.dspark_components.dspark_verify',
@@ -243,6 +251,10 @@ class EngramFinder(importlib.abc.MetaPathFinder):
                             'sglang.srt.speculative.dspark_components.dspark_draft',
                             'sglang.srt.speculative.dspark_components.dspark_planner',
                             'sglang.srt.model_executor.runner.flashinfer_autotune',
+                            'sglang.srt.layers.attention.dsv4.metadata'):
+            if not _tp4_launcher() or fullname not in (
+                            'sglang.srt.layers.attention.deepseek_v4_backend',
+                            'sglang.srt.model_loader.weight_utils',
                             'sglang.srt.distributed.device_communicators.pynccl',
                             'sglang.srt.layers.linear',
                             'sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe',
@@ -250,9 +262,8 @@ class EngramFinder(importlib.abc.MetaPathFinder):
                             'sglang.kernels.ops.layernorm.mhc',
                             'sglang.srt.models.deepseek_v2',
                             'b12x.comm.roce.roce_oneshot',
-                            'b12x.comm.roce_ring.roce_oneshot',
-                            'sglang.srt.layers.attention.dsv4.metadata'):
-            return None
+                            'b12x.comm.roce_ring.roce_oneshot'):
+                return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is not None:
             spec.loader = EngramLoader(spec.loader)
