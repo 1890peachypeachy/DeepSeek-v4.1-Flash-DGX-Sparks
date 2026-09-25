@@ -178,5 +178,44 @@ class CanaryDockerfileTests(unittest.TestCase):
         self.assertIn('-i "$PIP_INDEX"', text)
 
 
+class DockerfilePathTests(unittest.TestCase):
+    """Every COPY source exists in the repository and is not excluded from the build context;
+    every COPY --from=fetch source is a directory scripts/fetch_runtime.sh writes."""
+
+    FETCHED = {"/fetched/sglang-canary/python", "/fetched/b12x/b12x", "/fetched/b12x/LICENSE",
+               "/fetched/b12x_next/b12x_next", "/fetched/b12x_next/LICENSE"}
+
+    def copies(self, name):
+        text = (ROOT / name).read_text().replace("\\\n", " ")
+        for line in text.splitlines():
+            words = line.split()
+            if words[:1] == ["COPY"]:
+                yield words[1:-1]
+
+    def test_sources_exist(self):
+        ignored = [p.strip().rstrip("/") for p in (ROOT / ".dockerignore").read_text().splitlines()
+                   if p.strip() and not p.startswith("#")]
+        fetch = (ROOT / "scripts/fetch_runtime.sh").read_text()
+        for name in ("Dockerfile", "Dockerfile.canary", "Dockerfile.canary-roce"):
+            for srcs in self.copies(name):
+                if srcs and srcs[0] == "--from=fetch":
+                    for src in srcs[1:]:
+                        self.assertIn(src, self.FETCHED, f"{name}: {src}")
+                        self.assertIn(src.split("/")[2], fetch, f"{name}: {src}")
+                    continue
+                for src in srcs:
+                    self.assertTrue((ROOT / src).exists(), f"{name}: COPY {src} does not exist")
+                    self.assertNotIn(src.split("/")[0], ignored, f"{name}: {src} is in .dockerignore")
+
+    def test_base_images_are_pinned_alike(self):
+        froms = set()
+        for name in ("Dockerfile", "Dockerfile.canary", "Dockerfile.canary-roce"):
+            for line in (ROOT / name).read_text().splitlines():
+                if line.startswith("FROM "):
+                    froms.add(line.split()[1])
+        self.assertEqual(len(froms), 1, froms)
+        self.assertRegex(froms.pop(), r"@sha256:[0-9a-f]{64}$")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
