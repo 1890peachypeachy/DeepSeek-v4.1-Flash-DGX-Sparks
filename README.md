@@ -18,7 +18,7 @@ endpoint.
 | Decode, prose, 1 stream | 51.0 tok/s, TTFT 223 ms (~59 ms per speculative step) |
 | Decode, prose, 2 / 4 streams | 75.1 / 85.4 tok/s aggregate (39.0 / 22.8 per stream), TTFT 290 / 356 ms |
 | Decode, 4 Sparks (TP=4), prose, 1 / 2 / 4 / 8 / 16 streams | 87.7 / 120.4 / 163.6 / 237.6 / 342.7 tok/s aggregate (87.7 / 61.9 / 41.4 / 30.8 / 22.2 per stream). Code, structured and json are in [Four Sparks](#four-sparks-tp4) |
-| Prefill, 4 Sparks (TP=4), cold | ~5.8–5.9k tok/s at 16k–128k, ~5.4k tok/s at 262k |
+| Prefill, 4 Sparks (TP=4), cold, 4k / 16k / 32k / 64k / 128k / 262k | 4,059 / 5,855 / 5,900 / 5,925 / 5,797 / 5,394 tok/s (sparkDash 1.8.8, synthetic filler). Real text at 16k–128k is 4.9k–5.0k tok/s |
 | Context, 4 Sparks (TP=4) | 1M configured (model maximum) and verified: a 1,011,084-token needle passed on the production line (4096-token chunks with the chunked indexer, 8M KV pin, 0.80 memory fraction) |
 | Context | 256k limit configured (model max 1M). Verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts. With the 2026-09-24 decode stack a ~200k prompt at 1024 exhausted the head, so chunks are now 768 (191k verified before that change); KV pool 750k tokens |
 | Memory left on the head while serving | ~6 GB (was <1 GB) |
@@ -93,7 +93,7 @@ on top of this profile: the upstream SGLang `dsv4.1` branch image with RoCEnante
 (`Dockerfile.canary-roce`), EP 1 with the routed MoE on b12x, prefill sequence parallel, the
 fast loader and gated decode adapters. Measured from a fresh clone (sparkDash 1.8.8, greedy,
 switched fabric): prose c1 87.7 tok/s, code c1 124.8, prose c16 342.7 aggregate, cold prefill
-~5.8–5.9k tok/s at 16k–128k and ~5.4k tok/s at 262k, qeval 72/75, a 1,011,084-token needle passes. The profile,
+4,059 / 5,855 / 5,900 / 5,925 / 5,797 / 5,394 tok/s at 4k–262k, real text 4.9k–5.0k tok/s at 16k–128k, qeval 72/75, a 1,011,084-token needle passes. The profile,
 images, results, rollback and credits are on that page.
 
 `start-tp4.sh` is the same engine and image with a profile of its own: `.env.tp4`
@@ -188,7 +188,13 @@ climbing at 16 streams (342.7 tok/s) while each stream falls from 87.7 to 22.2 t
 | structured | 152.4 | 177.6 (103.3) | 240.4 (70.4) | 295.5 (44.2) | 572.2 (44.4) |
 | json | 118.9 | 174.2 (89.8) | 301.7 (76.2) | 471.5 (60.2) | 659.9 (42.7) |
 
-**Prefill**, cold: ~5.8–5.9k tok/s at 16k–128k and ~5.4k tok/s at 262k. The per-length table is in [docs/tp4.md](docs/tp4.md).
+**Prefill**, cold, tok/s (sparkDash 1.8.8, synthetic filler):
+
+| context | 4k | 16k | 32k | 64k | 128k | 262k |
+|---|---:|---:|---:|---:|---:|---:|
+| tok/s | 4,059 | 5,855 | 5,900 | 5,925 | 5,797 | 5,394 |
+
+The filler is one repeated token, so those 16k–128k rates sit on a hot Engram row. On real text (unique prompts, no prefix-cache hits) the same line runs 4.9k–5.0k tok/s at 16k–128k. The two-pass table is in [docs/tp4.md](docs/tp4.md).
 
 Fabric: a Spark has two ConnectX-7 ports, so three nodes form a full triangle but four
 cannot. A 4-node fleet needs either a RoCE switch, or the opt-in switchless-ring path in
