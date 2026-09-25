@@ -24,6 +24,24 @@ Third-party components and their licences:
 - runtime/flash_mla_sm120.py is derived from SGLang and remains under the Apache
   License 2.0 (LICENSE.sglang); the page-split changes are distributed under the
   same terms.
+- The TP4 production line (docs/tp4.md: the other adapters, Dockerfile.canary,
+  Dockerfile.canary-roce, scripts/fetch_runtime.sh, scripts/ring_mesh/, scripts/qeval*.py)
+  is contributed from knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4, AGPL-3.0-or-later.
+  In it: adapter/indexer_chunked*.py backport sgl-project/sglang#39187 (Apache License
+  2.0); adapter/spark_prefill_dense.py and runtime/sglang-rocenante.patch are rhys101's
+  SG18 helper and SG17 overlay (rhys101/DeepSeek-V4.1-Flash-vLLM-DGX-Spark-8, MIT);
+  runtime/flash_mla_sm120.canary.py is runtime/flash_mla_sm120.py re-applied to the
+  SGLang dsv4.1 branch kernel file (Apache License 2.0).
+- Fetched at image build, not stored here (runtime/sources.manifest pins each commit
+  and sha256): the SGLang dsv4.1 branch tree (Apache License 2.0); b12x at the SG17
+  revision and b12x main, renamed b12x_next and patched (local-inference-lab/b12x,
+  Apache License 2.0; the LICENSE file is installed next to each copy in the image);
+  b12x.comm.roce_ring, the path-aware RoCEnante package of FujitsuPolycom/sparkring
+  (commit f16b5f4), itself derived from local-inference-lab/b12x (RoCEnante, PR 295),
+  Apache License 2.0, with the local changes in scripts/roce_ring-sparkring-f16b5f4.patch
+  (origin: runtime/b12x/roce_ring-provenance.json). scripts/ring_mesh/plan.py drives
+  sparkring's fabric planner and the units run sparkring's RDMA-TX marker; neither is
+  vendored here (both come from a sparkring checkout, Apache License 2.0).
 - SGLang, FlashInfer, DeepGEMM, PyTorch, NVIDIA components and the DeepSeek model
   retain their respective upstream licences. This repository does not
   redistribute model weights.
