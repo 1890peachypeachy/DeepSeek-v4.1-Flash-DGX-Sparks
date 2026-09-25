@@ -17,9 +17,9 @@ endpoint.
 |---|---|
 | Decode, prose, 1 stream | 51.0 tok/s, TTFT 223 ms (~59 ms per speculative step) |
 | Decode, prose, 2 / 4 streams | 75.1 / 85.4 tok/s aggregate (39.0 / 22.8 per stream), TTFT 290 / 356 ms |
-| Decode, 4 Sparks (TP=4), 1 / 2 / 4 / 8 / 16 streams | 45.4 / 72.9 / 103.1 / 114.1 / 134.2 tok/s aggregate (45.4 / 37.9 / 26.7 / 23.2 / 22.0 per stream), TTFT 212 / 232 / 270 ms, 2.70 / 12.45 s |
+| Decode, 4 Sparks (TP=4), prose, 1 / 2 / 4 / 8 / 16 streams | 87.7 / 120.4 / 163.6 / 237.6 / 342.7 tok/s aggregate (87.7 / 61.9 / 41.4 / 30.8 / 22.2 per stream). Code, structured and json are in [Four Sparks](#four-sparks-tp4) |
 | Prefill, 4 Sparks, 4K / 16K / 32K / 64K / 128K | 3,350 / 3,782 / 3,768 / 3,531 / 3,251 tok/s (TTFT 1.23 / 4.34 / 8.70 / 18.57 / 40.32 s) |
-| Context, 4 Sparks (TP=4) | 1M configured (model maximum) and verified: a 1M-context needle test passed with the shipped profile (1024-token chunks, 8M KV pin, 0.80 memory fraction) |
+| Context, 4 Sparks (TP=4) | 1M configured (model maximum) and verified: a 1,011,084-token needle passed on the production line (4096-token chunks with the chunked indexer, 8M KV pin, 0.80 memory fraction) |
 | Context | 256k limit configured (model max 1M). Verified with the prefill empty-cache hook and 1024-token chunks: single prompts to 208k, 4 concurrent 46k prompts. With the 2026-09-24 decode stack a ~200k prompt at 1024 exhausted the head, so chunks are now 768 (191k verified before that change); KV pool 750k tokens |
 | Memory left on the head while serving | ~6 GB (was <1 GB) |
 | Greedy decoding | deterministic run to run |
@@ -88,22 +88,32 @@ Set `API_KEY` in `.env` to require a bearer token (`state/api-key` holds it).
 
 ## Four Sparks (TP=4)
 
+**TP4 production line: [docs/tp4.md](docs/tp4.md).** An opt-in serving line for four Sparks
+on top of this profile: the upstream SGLang `dsv4.1` branch image with RoCEnante
+(`Dockerfile.canary-roce`), EP 1 with the routed MoE on b12x, prefill sequence parallel, the
+fast loader and gated decode adapters. Measured from a fresh clone (sparkDash 1.8.8, greedy,
+switched fabric): prose c1 87.7 tok/s, code c1 124.8, prose c16 342.7 aggregate, cold prefill
+~5.8-5.9k tok/s from 16k to 128k, qeval 72/75, a 1,011,084-token needle passes. The profile,
+images, results, rollback and credits are on that page.
+
 `start-tp4.sh` is the same engine and image with a profile of its own: `.env.tp4`
 (copied from `.env.tp4.example` on first run), `state-tp4/` and `logs-tp4/`, so one
 checkout can drive a 3-node and a 4-node fleet. Everything TP4-specific lives in
 `.env.tp4.example`: 4 workers (`WORKER_IPS`, `WORKER_HOSTS`, `NFS_SERVER_IPS`, one address
-for all workers behind a switch or one per worker), `TP_SIZE=EP_SIZE=4`, and a runtime sized
-for the ~40 GB per rank that TP4 leaves free (~77 GiB of weights per rank instead of ~101).
-The profile ships with these defaults:
+for all workers behind a switch or one per worker), `TP_SIZE=4` (`EP_SIZE=2` on the base and
+canary images, 1 on the production image), and a runtime sized for the ~40 GB per rank that
+TP4 leaves free (~77 GiB of weights per rank instead of ~101). The profile ships with these
+defaults:
 
 | TP4 setting | Value | Why |
 |---|---|---|
 | `CONTEXT_LENGTH` | 1,048,576 | model maximum; a 1M-context needle test passed at these settings |
 | `MAX_TOTAL_TOKENS` | 8,000,000 | 13.4 GB of KV per rank: 8 requests at ~1M tokens each; see below |
-| `MAX_RUNNING_REQUESTS` | 8 | also `--cuda-graph-max-bs-decode`: capture covers batch 1-8. Needs `--min-free-slots-delay 1` to be reachable; see below |
-| `CHUNKED_PREFILL_SIZE` | 1024 | ~15 GB peak indexer transient at 1M context (4096 would need ~60 GB); the size the long-context envelope was verified at |
+| `MAX_RUNNING_REQUESTS` | 16 | also `--cuda-graph-max-bs-decode`: capture covers batch 1-16. Needs `--min-free-slots-delay 1` to be reachable; see below |
+| `CHUNKED_PREFILL_SIZE` | 4096 | with `DSV41_INDEXER_CHUNKED=1` (sglang#39187 backport), which bounds the indexer transient; without the backport 1024 is the safe size (~15 GB peak at 1M context, 4096 would need ~60 GB) |
 | `MEM_FRACTION_STATIC` | 0.80 | keeps ~24 GiB per rank outside the static pool for that transient |
 | `DSV41_TP_PAD` | 0 | heads, o_groups, draft experts and vocab all divide by 4: no padded shards |
+| `DSPARK_BLOCK_SIZE` | 5 | on TP4 k=5 wins on code and ties on prose |
 
 **The KV pin.** At TP4 the boot log's budget line — `DSV4 memory calculation:
 bytes_per_full_token=1670.75 ... full_token=` — reported room for ~16M tokens (~26.7 GB per
@@ -115,7 +125,8 @@ all 8 at the full context). The 0.80 fraction is what keeps ~24 GiB per rank out
 static pool for the prefill transient, so if the pool ever has to shrink, lower the pin
 rather than raise the fraction. **Long prefills:** the indexer's per-chunk transient peaks
 at about 14 B × chunk × prefix (`docs/chunked-prefill-memory.md`): ~15 GB for a 1024-token
-chunk at 1M context and ~60 GB for 4096, which is why the chunk is 1024. A 1M-context
+chunk at 1M context and ~60 GB for 4096, which is why a 4096 chunk needs the chunked indexer
+(`DSV41_INDEXER_CHUNKED=1`, on in this profile) that scores it in bounded row chunks. A 1M-context
 needle-in-a-haystack test passed on TP4 with these settings, so the 1M envelope is verified
 end to end rather than extrapolated; `scripts/verify/memguard.py` remains the tool for
 ramping new prompt shapes, and dropping the chunk to 512 is the lever if it ever fires.
@@ -144,7 +155,8 @@ cp -n .env.tp4.example .env.tp4      # IPs, ssh user, NFS addresses
 ./start-tp4.sh serve                 # ./start-tp4.sh stop|status|logs worker3
 ```
 
-What changes against the 3-node profile:
+What changes against the 3-node profile. The TP4 column is the production line
+([docs/tp4.md](docs/tp4.md)):
 
 | | 3 Sparks (TP3) | 4 Sparks (TP4) |
 |---|---|---|
@@ -152,37 +164,31 @@ What changes against the 3-node profile:
 | free memory per rank while serving | ~6 GB | ~40 GB |
 | attention shards | heads padded 64→96, groups 8→12; rank 2 is all padding | exact: 16 heads, 2 groups per rank, no wasted GEMMs |
 | KV pool / context | 750k tokens / 256k limit, ~32k usable (memory-bound on the head) | 8M tokens (pinned) / 1M (model maximum; needle test passed at 1M) |
-| concurrency | 4 | 8 by default (measured to 16) |
+| concurrency | 4 | 16 |
 | NCCL per step | 104 collectives across 3 nodes | 104 collectives across 4 nodes (one more ring hop each) |
-| decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms | 45.4 tok/s, TTFT 212 ms |
-| decode, prose, 4 streams | 78.6 tok/s agg (20.9 per stream), TTFT 383 ms | 103.1 tok/s agg (26.7 per stream), TTFT 270 ms |
+| decode, prose, 1 stream | 37.9 tok/s, TTFT 248 ms | 87.7 tok/s |
+| decode, prose, 4 streams | 78.6 tok/s agg (20.9 per stream), TTFT 383 ms | 163.6 tok/s agg (41.4 per stream) |
 
-Measured on 4× DGX Spark with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (prose
-decode, 256 completion tokens; prefill at 4K–128K). Decode is faster than the 3-node fleet at every concurrency — smaller
+Measured on 4× DGX Spark with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (greedy,
+256 completion tokens). Decode is faster than the 3-node fleet at every concurrency — smaller
 attention GEMMs per rank and no padded shards more than pay for the extra NCCL hop.
 An independent switchless-ring reproduction (public OpenAI path, idle cluster,
 greedy code, estimated decode window 129–641) is in
 [`docs/tp4-switchless-ring-results.md`](docs/tp4-switchless-ring-results.md): C1 window
-67.4 tok/s estimated, C8 aggregate 224.8 tok/s (historical DSpark k=5; current
-default remains k=3).
-The memory headroom is what makes the 1M context possible. Decode has been measured out to
-16 streams (with `MAX_RUNNING_REQUESTS=16`): aggregate throughput is still climbing there
-(134.2 tok/s) but per-stream rate has flattened at ~22 tok/s and TTFT degrades sharply past
-4 streams — 2.70 s at 8, 12.45 s at 16 — as prefills queue behind each other. Concurrency 16
-is a throughput operating point, not a latency one; the profile defaults to 8, and raising
-`MAX_RUNNING_REQUESTS` (with the KV pin to match) is how to get the 16-stream point back.
+67.4 tok/s estimated, C8 aggregate 224.8 tok/s. The production profile uses DSpark k=5.
+The memory headroom is what makes the 1M context possible. Prose aggregate is still
+climbing at 16 streams (342.7 tok/s) while each stream falls from 87.7 to 22.2 tok/s.
 
-**Decode** (prose, 256 tok):
+**Decode** (greedy, 256 tok; aggregate tok/s, per stream in brackets):
 
-| load | TTFT | aggregate | per stream |
-|---|---:|---:|---:|
-| ×1 | 212 ms | 45.4 tok/s | 45.4 tok/s |
-| ×2 | 232 ms | 72.9 tok/s | 37.9 tok/s |
-| ×4 | 270 ms | 103.1 tok/s | 26.7 tok/s |
-| ×8 | 2.70 s | 114.1 tok/s | 23.2 tok/s |
-| ×16 | 12.45 s | 134.2 tok/s | 22.0 tok/s |
+| prompt type | c1 | c2 | c4 | c8 | c16 |
+|---|---:|---:|---:|---:|---:|
+| prose | 87.7 | 120.4 (61.9) | 163.6 (41.4) | 237.6 (30.8) | 342.7 (22.2) |
+| code | 124.8 | 175.0 (88.4) | 246.8 (63.2) | 309.8 (41.4) | 438.3 (29.3) |
+| structured | 152.4 | 177.6 (103.3) | 240.4 (70.4) | 295.5 (44.2) | 572.2 (44.4) |
+| json | 118.9 | 174.2 (89.8) | 301.7 (76.2) | 471.5 (60.2) | 659.9 (42.7) |
 
-**Prefill:**
+**Prefill** on the earlier TP4 profile (EP 4, 1024-token chunks). Production-line prefill is in [docs/tp4.md](docs/tp4.md):
 
 | context | prompt tokens | TTFT | prefill |
 |---|---:|---:|---:|
@@ -222,6 +228,9 @@ start.sh                 doctor / build / share / pack / serve / stop / status /
 start-tp4.sh             same commands for 4 Sparks (profile: .env.tp4, state-tp4/, logs-tp4/)
 boot.py                  in-container entrypoint: download+verify (optional), launch, smoke
 Dockerfile               lmsysorg/sglang:dev-dsv41 pinned by digest (sha256:3dbc3130…, arm64) + adapter/ + runtime/ overlay
+Dockerfile.canary        TP4: same base, SGLang dsv4.1 branch tree (fetched at build)
+Dockerfile.canary-roce   TP4 production image: + RoCEnante overlay, b12x (SG17 + roce_ring), b12x main as b12x_next
+runtime/sources.manifest pinned commits + sha256 of everything the TP4 images fetch (scripts/fetch_runtime.sh)
 adapter/
   sitecustomize.py       import hooks that install the pieces below at process start
   encoding_compat.py     enable_thinking alias, publisher effort table, max_tokens cap
@@ -239,6 +248,9 @@ adapter/
   engram_prefetch.py     Engram row lookups on a side stream            }
   autotune_keep.py       keep FlashInfer autotune caches across boots   }
   draft_tau.py, folded_result_fence.py   present, off                   }
+  draft_head_fp8_tp4.py, fast_load.py, moe_b12x_next.py, prefill_sp.py, l2_prefetch.py, replicated_split.py,
+  draft_main_proj.py, roce_gather.py, router_live.py, hc_fused.py, shared_pad_k.py,
+  indexer_chunked*.py, spark_prefill_dense.py   TP4 production line, all gated (docs/tp4-adapters.md)
 runtime/flash_mla_sm120.py  SM12x sparse-MLA dispatch (64-token page split for FlashInfer)
 scripts/pack_engram.py   repack one rank's Engram rows (weight+scale adjacent) to local disk
 scripts/profile/         torch-profiler helper and trace analysers (see Profiling)
@@ -450,9 +462,16 @@ fails), and the head has little RAM to spare.
     `SGLANG_RUN_ID` from the launch fingerprint (with it, no cache was ever reused); test extended.
   - Configuration ideas from knapcio's measurements: DSpark k=5 with the `conf:0.1` cap. Each was
     re-measured on TP3 one switch per boot before it became a default.
-  - Not adopted: RoCEnante transport, the display-reservation (DRM) row cache, shared-expert
-    padding, fast load, the chunked-indexer prefill variants, the canary image, and the TP4
-    memory profile (16 slots, 8M KV, 0.80 fraction).
+  - Not adopted for the TP3 profile: RoCEnante transport, the display-reservation (DRM) row
+    cache, shared-expert padding, fast load, the chunked-indexer prefill variants and the canary
+    image. They are part of the opt-in TP4 production line below.
+- **TP4 production line** ([docs/tp4.md](docs/tp4.md)): contributed by knapcio from
+  [knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4)
+  (v2.1; per-change history and measurements there), with work from b12x / local-inference-lab
+  (RoCEnante, fused MoE), rhys101 (SG17 RoCEnante overlay, SG18 prefill TP split), LuZ, sumsliu,
+  FujitsuPolycom/sparkring and rsync (RoCEnante on a switchless ring), Saolence, kpham-sgl
+  (sglang#39187) and the SGLang `dsv4.1` branch; full credits in docs/tp4.md. Third-party
+  sources are fetched at build from their pinned commits (`runtime/sources.manifest`).
 - **Originally this repository's** (unchanged by the above): TP3 padding (`tp3_pad.py`), the b12x
   MXFP8 route and padded-scale repair (`mxfp8_b12x.py`), the NVMe Engram row store and packed
   shards (`engram_backend.py`, `row_store.cpp`, `scripts/pack_engram.py`, which the prefetch

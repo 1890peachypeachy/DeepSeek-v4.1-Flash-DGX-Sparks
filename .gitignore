@@ -40,3 +40,6 @@ docs/results/*/envs/
 docs/results/*/env-*.txt
 docs/results/*/dot-env.snapshot
 docs/results/*/mounts-*.json
+
+# host-side output of scripts/fetch_runtime.sh (the image builds fetch their own copy)
+runtime/fetched/

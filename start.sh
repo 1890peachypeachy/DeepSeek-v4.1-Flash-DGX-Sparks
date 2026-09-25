@@ -96,6 +96,12 @@ EXPECTED_SHARDS="${EXPECTED_SHARDS:-48}"
 
 BASE_IMAGE="${BASE_IMAGE:-lmsysorg/sglang:dev-dsv41@sha256:3dbc313030a6ef2c5d7de8ecf48e9aece722694a82182cb618cc82b588816349}"   # same pin as the Dockerfile FROM
 IMAGE="${IMAGE:-dsv41-3x-spark:local}"
+# Honoured only when start-tp4.sh has set DSV41_LAUNCHER=tp4. ./start.sh always
+# builds Dockerfile and does not read these. A TP4 profile that runs one of the
+# canary images sets BUILD_DOCKERFILE so `build` produces $IMAGE from that recipe;
+# BUILD_ARGS carries the rest, e.g. --build-arg PIP_INDEX=<mirror>/simple.
+BUILD_DOCKERFILE="${BUILD_DOCKERFILE:-Dockerfile}"
+BUILD_ARGS="${BUILD_ARGS:-}"
 HEAD_CTN="${HEAD_CTN:-dsv41-head}"
 WORKER_CTN="${WORKER_CTN:-dsv41-worker}"
 WORKER_DIR="${WORKER_DIR:-/home/${WORKER_USER}/dsv41-3x-spark}"
@@ -376,6 +382,37 @@ docker_common_args() {
   fi
   switchless_ring_args _a
   nccl_mount_args _a || die "NCCL mount setup failed"
+  # start-tp4.sh only. ./start.sh does not pass these and does not read EXTRA_CONTAINER_ENV.
+  if [[ "${DSV41_LAUNCHER:-}" == tp4 ]]; then
+    _a+=(
+      -e "DSV41_LAUNCHER=tp4"
+      -e "DSV41_SHARED_PAD_K=${DSV41_SHARED_PAD_K:-0}"
+      -e "DSV41_SHARED_PAD_BUF_ROWS=${DSV41_SHARED_PAD_BUF_ROWS:-256}"
+    )
+    extra_container_env_args _a
+  fi
+}
+
+# EXTRA_CONTAINER_ENV="KEY=VALUE KEY2=VALUE2" (whitespace separated). Called only from the
+# start-tp4.sh path. Container env for the head and every worker, so the TP4 profile's
+# switches are one .env line. A key the launcher already passes is replaced in place, not
+# repeated: a repeated -e leaves both entries, and which one a process reads depends on it.
+extra_container_env_args() {
+  local -n _xa=$1
+  local -a _items=()
+  local _kv _i _found
+  read -r -a _items <<<"${EXTRA_CONTAINER_ENV:-}"
+  for _kv in "${_items[@]}"; do
+    [[ "$_kv" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "EXTRA_CONTAINER_ENV: '$_kv' is not KEY=VALUE"
+    _found=0
+    for _i in "${!_xa[@]}"; do
+      if [[ "${_xa[$_i]}" == -e && "${_xa[$((_i + 1))]:-}" == "${_kv%%=*}="* ]]; then
+        _xa[$((_i + 1))]="$_kv"
+        _found=1
+      fi
+    done
+    [[ "$_found" == 1 ]] || _xa+=(-e "$_kv")
+  done
 }
 
 # Every rank builds its own planner, so the SPS/STS calibration has to exist on
@@ -488,6 +525,14 @@ worker_env_lines() {
     worker_args+=(-e "SGLANG_DSPARK_FOLDED_SAMPLING=$SGLANG_DSPARK_FOLDED_SAMPLING")
   fi
   switchless_ring_args worker_args
+  if [[ "${DSV41_LAUNCHER:-}" == tp4 ]]; then
+    worker_args+=(
+      -e "DSV41_LAUNCHER=tp4"
+      -e "DSV41_SHARED_PAD_K=${DSV41_SHARED_PAD_K:-0}"
+      -e "DSV41_SHARED_PAD_BUF_ROWS=${DSV41_SHARED_PAD_BUF_ROWS:-256}"
+    )
+    extra_container_env_args worker_args
+  fi
   printf '        %q ' "${worker_args[@]}"
   printf '\\\n'
 }
@@ -648,11 +693,25 @@ cmd_pull() {
 }
 
 cmd_build() {
-  info "=== build $IMAGE from $ROOT ==="
+  local dockerfile="Dockerfile" build_args=""
+  if [[ "${DSV41_LAUNCHER:-}" == tp4 ]]; then
+    info "=== build $IMAGE from $ROOT ($BUILD_DOCKERFILE) ==="
+    dockerfile="$BUILD_DOCKERFILE"
+    case "$dockerfile" in /*) die "BUILD_DOCKERFILE must be inside the repository (got $dockerfile)";; esac
+    [[ -f "$ROOT/$dockerfile" ]] || die "no such Dockerfile: $ROOT/$dockerfile"
+    build_args="$BUILD_ARGS"
+  else
+    info "=== build $IMAGE from $ROOT ==="
+  fi
   if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
     cmd_pull
   fi
-  docker build -t "$IMAGE" "$ROOT"
+  # shellcheck disable=SC2086  # build_args is a list of docker build flags on the TP4 path
+  if [[ "${DSV41_LAUNCHER:-}" == tp4 ]]; then
+    docker build -f "$ROOT/$dockerfile" -t "$IMAGE" $build_args "$ROOT"
+  else
+    docker build -t "$IMAGE" "$ROOT"
+  fi
   local img_arch
   img_arch=$(docker image inspect -f '{{.Architecture}}' "$IMAGE")
   [[ "$img_arch" == "arm64" ]] || die "expected arm64 image, got $img_arch"
@@ -663,15 +722,35 @@ cmd_build() {
   for h in "${WORKER_HOSTS[@]}"; do
     info "rsync recipe → $h:$WORKER_DIR"
     remote_on "$h" "mkdir -p $(printf '%q' "$WORKER_DIR")"
-    rsync -aH --delete --exclude '.env' --exclude '.env.tp4' --exclude 'state' --exclude 'state-tp4' \
-      --exclude 'logs' --exclude 'logs-tp4' --exclude 'models' \
-      --exclude 'engram' \
-      -e "$(ssh_rsync_e)" \
-      "$ROOT/" "${WORKER_USER}@${h}:${WORKER_DIR}/"
-    info "docker build on $h ..."
-    remote_on "$h" --timeout "${BUILD_TIMEOUT:-0}" \
-      "docker image inspect $(printf '%q' "$BASE_IMAGE") >/dev/null || docker pull --platform linux/arm64 $(printf '%q' "$BASE_IMAGE")
-       cd $(printf '%q' "$WORKER_DIR") && docker build -t $(printf '%q' "$IMAGE") ."
+    if [[ "${DSV41_LAUNCHER:-}" == tp4 ]]; then
+      # rsync-tp4
+      # Anchored on purpose: an unanchored `models` also matches .../sglang/srt/models (and
+      # `engram` any engram/ package), and an excluded directory is never transferred, so the
+      # worker's copy goes stale. runtime/fetched/ is host-side staging, never built from.
+      rsync -aH --delete --exclude '.env' --exclude '.env.tp4' \
+        --exclude '/state' --exclude '/state-tp4' \
+        --exclude '/logs' --exclude '/logs-tp4' --exclude '/models' \
+        --exclude '/engram' --exclude '/runtime/fetched' \
+        -e "$(ssh_rsync_e)" \
+        "$ROOT/" "${WORKER_USER}@${h}:${WORKER_DIR}/"
+      # end-rsync-tp4
+      info "docker build on $h ..."
+      remote_on "$h" --timeout "${BUILD_TIMEOUT:-0}" \
+        "docker image inspect $(printf '%q' "$BASE_IMAGE") >/dev/null || docker pull --platform linux/arm64 $(printf '%q' "$BASE_IMAGE")
+         cd $(printf '%q' "$WORKER_DIR") && docker build -f $(printf '%q' "$dockerfile") -t $(printf '%q' "$IMAGE") $build_args ."
+    else
+      # rsync-start
+      rsync -aH --delete --exclude '.env' --exclude '.env.tp4' --exclude 'state' --exclude 'state-tp4' \
+        --exclude 'logs' --exclude 'logs-tp4' --exclude 'models' \
+        --exclude 'engram' \
+        -e "$(ssh_rsync_e)" \
+        "$ROOT/" "${WORKER_USER}@${h}:${WORKER_DIR}/"
+      # end-rsync-start
+      info "docker build on $h ..."
+      remote_on "$h" --timeout "${BUILD_TIMEOUT:-0}" \
+        "docker image inspect $(printf '%q' "$BASE_IMAGE") >/dev/null || docker pull --platform linux/arm64 $(printf '%q' "$BASE_IMAGE")
+         cd $(printf '%q' "$WORKER_DIR") && docker build -t $(printf '%q' "$IMAGE") ."
+    fi
   done
   info "overlay image on all 3 nodes"
 }
