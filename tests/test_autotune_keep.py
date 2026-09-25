@@ -23,7 +23,6 @@ def fake_module(paths, contents):
         paths[model_runner].write_text(contents[model_runner])   # tuning saves its cache
 
     mod.seen = seen
-
     mod.flashinfer_autotune_context = ctx
     mod.flashinfer_autotune_cache_path = lambda mr: paths[mr]
     return mod
@@ -43,7 +42,8 @@ def main():
     ak.install(mod)
     env = {"cuda": "13.0"}
     assert mod._autotune_cache_digest(paths[0], env) == "", "no sidecar yet: must not be kept"
-    for rank in (0, 1):                                  # a tuning boot writes the sidecars
+    assert not paths[0].exists(), "a cache without a matching sidecar must be deleted (forces a re-tune)"
+    for rank in (0, 1):                                  # a tuning boot writes the caches and sidecars
         with mod.flashinfer_autotune_context(rank):
             pass
     assert mod.seen == {0: False, 1: False}, "a cache without this launch's sidecar must not be loaded"
@@ -55,15 +55,21 @@ def main():
     assert d0 and d0 == d1, "disjoint EP shape sets with matching launches must digest alike"
     ak.sidecar(paths[1]).write_text("other-launch\n")
     assert mod._autotune_cache_digest(paths[1], env) == "", "a changed launch must drop the cache"
+    assert not paths[1].exists(), "and delete it, so no rank can load it"
+    fp_before = ak.launch_fingerprint()
+    os.environ["SGLANG_RUN_ID"] = "sglang-run-1.0-1"   # per boot, set by the engine
+    assert ak.launch_fingerprint() == fp_before
+    os.environ["SGLANG_RUN_ID"] = "sglang-run-2.0-2"
+    assert ak.launch_fingerprint() == fp_before
+    os.environ["DSV41_REPLICATED_SPLIT"] = "wqkv_a"      # decode-side switch: volatile
+    assert ak.launch_fingerprint() == fp_before
+    os.environ["DSV41_WO_A_W8_DRAFT"] = "1"              # draft einsum route: volatile
+    assert ak.launch_fingerprint() == fp_before
     os.environ["DSV41_VERIFY_CAP"] = "conf:0.1"          # A/B-neutral switch: same fingerprint
     assert ak.launch_fingerprint() == ak.launch_fingerprint()
     fp_a = ak.launch_fingerprint()
     os.environ["DSV41_VERIFY_CAP"] = "3"
     assert ak.launch_fingerprint() == fp_a
-    os.environ["SGLANG_RUN_ID"] = "sglang-run-1.0-1"          # per-boot id: must not enter the fingerprint
-    fp_run = ak.launch_fingerprint()
-    os.environ["SGLANG_RUN_ID"] = "sglang-run-2.0-2"
-    assert ak.launch_fingerprint() == fp_run
     os.environ["SGLANG_SOMETHING_SHAPED"] = "1"
     assert ak.launch_fingerprint() != fp_a
     print("test_autotune_keep: ok")
