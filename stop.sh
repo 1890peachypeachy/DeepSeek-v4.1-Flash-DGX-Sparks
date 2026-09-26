@@ -118,8 +118,14 @@ pkill -f "docker logs -f ${HEAD_CTN}" >/dev/null 2>&1 || true
 info "head: SIGTERM sglang in $HEAD_CTN, then remove"
 _stop_sglang_in "$HEAD_CTN"
 _rm_ctn "$HEAD_CTN"
-# anything else this recipe named
-ids=$(docker ps -aq --filter "name=dsv41-" 2>/dev/null || true)
+# anything else this recipe named -- EXCLUDING the shared weight-serving NFS
+# exporter (dsv41-nfs). Incident 2026-09-25: the old blanket
+# `--filter name=dsv41-` matched dsv41-nfs too, so this rm -f force-killed the
+# live NFS export while worker nodes still had it mounted read-only for
+# weights. That wedged spark3's host (NVRM NV_ERR_NO_MEMORY storm, no clean
+# shutdown in dmesg/journal) and required a hard power-cycle to recover --
+# stop.sh must NEVER touch the NFS exporter unless --unmount is explicitly passed.
+ids=$(docker ps -a --format '{{.ID}} {{.Names}}' --filter "name=dsv41-" 2>/dev/null | awk '$2 !~ /nfs/ {print $1}' || true)
 if [[ -n "$ids" ]]; then
   # shellcheck disable=SC2086
   timeout "$RM_TIMEOUT" docker rm -f $ids >/dev/null 2>&1 || true
@@ -136,7 +142,8 @@ for h in "${WORKER_HOSTS[@]}"; do
       ' 2>/dev/null || true
     fi
     timeout ${RM_TIMEOUT} docker rm -f $(printf '%q' "$WORKER_CTN") >/dev/null 2>&1 || docker rm -f $(printf '%q' "$WORKER_CTN") >/dev/null 2>&1 || true
-    ids=\$(docker ps -aq --filter name=dsv41- 2>/dev/null || true)
+    # exclude the shared dsv41-nfs exporter -- see head-side comment above (2026-09-25 wedge incident)
+    ids=\$(docker ps -a --format '{{.ID}} {{.Names}}' --filter name=dsv41- 2>/dev/null | awk '\$2 !~ /nfs/ {print \$1}' || true)
     [ -n \"\$ids\" ] && docker rm -f \$ids >/dev/null 2>&1 || true
     echo STOPPED_$h
   " 2>/dev/null | grep -q "STOPPED_$h"; then
